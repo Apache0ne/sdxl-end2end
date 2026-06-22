@@ -1,3 +1,25 @@
+### Only human input is here : How human runs this project using powershell:
+
+IF you never ran this project before: 1st Agent prompt: ```Audit this project: "Path to the project folder on users system". make a compact list of installs I need to run the project and check what I already have and do not have installed with web links to the needed installs I dont have. ```
+
+IF you already have the needed installs from 1st Agent prompt: 2nd Agent prompt: ```I have the new build of this project: send me the commands for me to build it and run it: "Path to the project folder on users system" ```
+
+ADD this context to help with models understanding of the CLI:
+```
+cd path to folder of the project 
+
+$env:CUDNN_ROOT="the users CUDNN path"
+$env:PATH="The users NVIDIA GPU Computing Toolkit path"
+
+& "The users cmake exe path" -S . -B build-cuda13 -G "Visual Studio 17 2022" -A x64 -T cuda=" NVIDIA GPU Computing Toolkit path of the user" -DSDXL_CUDA_ARCHITECTURES=86 -DSDXL_CUDA_FAST_MATH=ON -DSDXL_BUILD_TESTS=OFF -DSDXL_BUILD_CPU_REFERENCE=OFF
+
+& "The users cmake exe path" --build build-cuda13 --config Release --target sdxl_cuda_denoise --parallel
+
+.\build-cuda13\Release\sdxl_cuda_denoise.exe "The users path to their .safetensors file they are using" 1024 1024 4 1.0 1234 euler "a cinematic photograph of a city at night" "blurry" "output.png" 0 0.0 fp8-auto
+
+```
+
+
 # Production-style pure C++/CUDA SDXL runtime
 
 This project is a Python-free, LibTorch-free SDXL Base 1.0 inference engine written in C++20 and CUDA. It accepts a complete SDXL `.safetensors` checkpoint or a Diffusers component directory and produces RGB PNG files end to end.
