@@ -1,0 +1,68 @@
+cmake_minimum_required(VERSION 3.20)
+project(sdxl_raw_arch_loader LANGUAGES CXX)
+
+find_package(Threads REQUIRED)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+option(SDXL_ENABLE_AVX2 "Build CPU dot-product kernels with AVX2" ON)
+
+add_library(sdxl_raw STATIC
+    src/json.cpp
+    src/safetensors.cpp
+    src/model.cpp
+    src/sdxl.cpp
+    src/tokenizer.cpp
+    src/resources/sdxl_tokenizer_data.cpp
+    src/text_encoder.cpp
+    src/unet.cpp
+    src/scheduler.cpp
+    src/denoiser.cpp
+)
+
+target_include_directories(sdxl_raw PUBLIC include)
+target_link_libraries(sdxl_raw PUBLIC Threads::Threads)
+
+if(SDXL_ENABLE_AVX2)
+    if(MSVC)
+        target_compile_options(sdxl_raw PRIVATE /arch:AVX2)
+    else()
+        target_compile_options(sdxl_raw PRIVATE -mavx2)
+    endif()
+endif()
+
+if(MSVC)
+    target_compile_options(sdxl_raw PRIVATE /W4 /permissive- /EHsc /utf-8)
+else()
+    target_compile_options(sdxl_raw PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+endif()
+
+add_executable(sdxl_inspect src/main.cpp)
+target_link_libraries(sdxl_inspect PRIVATE sdxl_raw)
+
+add_executable(sdxl_text_encode src/text_main.cpp)
+target_link_libraries(sdxl_text_encode PRIVATE sdxl_raw)
+
+add_executable(sdxl_denoise src/denoise_main.cpp)
+target_link_libraries(sdxl_denoise PRIVATE sdxl_raw)
+
+install(TARGETS sdxl_raw sdxl_inspect sdxl_text_encode sdxl_denoise)
+
+enable_testing()
+add_executable(sdxl_tokenizer_test tests/tokenizer_test.cpp)
+target_link_libraries(sdxl_tokenizer_test PRIVATE sdxl_raw)
+add_test(NAME sdxl_tokenizer_test COMMAND sdxl_tokenizer_test)
+
+add_executable(sdxl_text_encoder_test tests/text_encoder_test.cpp)
+target_link_libraries(sdxl_text_encoder_test PRIVATE sdxl_raw)
+add_test(NAME sdxl_text_encoder_test COMMAND sdxl_text_encoder_test)
+
+add_executable(sdxl_unet_scheduler_test tests/unet_scheduler_test.cpp)
+target_link_libraries(sdxl_unet_scheduler_test PRIVATE sdxl_raw)
+add_test(NAME sdxl_unet_scheduler_test COMMAND sdxl_unet_scheduler_test)
+
+add_executable(sdxl_builtin_tokenizer_test tests/builtin_tokenizer_test.cpp)
+target_link_libraries(sdxl_builtin_tokenizer_test PRIVATE sdxl_raw)
+add_test(NAME sdxl_builtin_tokenizer_test COMMAND sdxl_builtin_tokenizer_test)
