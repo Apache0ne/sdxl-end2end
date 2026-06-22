@@ -1,5 +1,9 @@
 ### Only human input is here : How human runs this project using powershell:
 
+<p align="center">
+  <img src="assets/output.png" alt="Output Image" width="500">
+</p>
+
 IF you never ran this project before: 1st Agent prompt: ```Audit this project: "Path to the project folder on users system". make a compact list of installs I need to run the project and check what I already have and do not have installed with web links to the needed installs I dont have. ```
 
 IF you already have the needed installs from 1st Agent prompt: 2nd Agent prompt: ```I have the new build of this project: send me the commands for me to build it and run it: "Path to the project folder on users system" ```
@@ -18,9 +22,6 @@ $env:PATH="The users NVIDIA GPU Computing Toolkit path"
 .\build-cuda13\Release\sdxl_cuda_denoise.exe "The users path to their .safetensors file they are using" 1024 1024 4 1.0 1234 euler "a cinematic photograph of a city at night" "blurry" "output.png" 0 0.0 fp8-auto
 
 ```
-<p align="center">
-  <img src="assets/output.png" alt="Output Image" width="500">
-</p>
 
 # Production-style pure C++/CUDA SDXL runtime
 
