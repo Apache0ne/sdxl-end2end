@@ -1,4 +1,4 @@
-### Only human input is here : How a human runs this project using powershell:
+### Only human input is here : How a (hummus)human runs this project using powershell:
 
 <p align="center">
   <img src="assets/output.png" alt="Output Image" width="500">
