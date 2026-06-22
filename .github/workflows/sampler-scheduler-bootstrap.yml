@@ -1,21 +1,25 @@
 name: Apply sampler and scheduler implementation
 
 on:
-  push:
+  pull_request:
     branches:
-      - chatgpt-branch-test
-    paths:
-      - .github/workflows/sampler-scheduler-bootstrap.yml
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
 
 permissions:
   contents: write
 
 jobs:
   apply:
+    if: github.head_ref == 'chatgpt-branch-test'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: chatgpt-branch-test
           fetch-depth: 0
       - name: Reconstruct validated patch
         shell: bash
