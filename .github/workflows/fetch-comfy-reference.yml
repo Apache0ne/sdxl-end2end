@@ -1,0 +1,24 @@
+name: Fetch Comfy sampler references
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    if: github.head_ref == 'reference-fetch-temp'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download current ComfyUI references
+        run: |
+          mkdir refs
+          curl -L --fail https://raw.githubusercontent.com/Comfy-Org/ComfyUI/master/comfy_extras/nodes_gits.py -o refs/nodes_gits.py
+          curl -L --fail https://raw.githubusercontent.com/Comfy-Org/ComfyUI/master/comfy/k_diffusion/sampling.py -o refs/sampling.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: comfy-sampler-references
+          path: refs
