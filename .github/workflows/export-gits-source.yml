@@ -1,0 +1,24 @@
+name: Export exact GITS source
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    if: github.head_ref == 'gits-source-artifact'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download pinned ComfyUI GITS implementation
+        run: |
+          curl -fL https://raw.githubusercontent.com/Comfy-Org/ComfyUI/434a24387b41085edd8aa6109292144528618871/comfy_extras/nodes_gits.py -o nodes_gits.py
+          sha256sum nodes_gits.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exact-gits-source
+          path: nodes_gits.py
+          if-no-files-found: error
