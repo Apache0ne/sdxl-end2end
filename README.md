@@ -18,7 +18,9 @@ $env:PATH="The users NVIDIA GPU Computing Toolkit path"
 .\build-cuda13\Release\sdxl_cuda_denoise.exe "The users path to their .safetensors file they are using" 1024 1024 4 1.0 1234 euler "a cinematic photograph of a city at night" "blurry" "output.png" 0 0.0 fp8-auto
 
 ```
-
+<p align="center">
+  <img src="assets/output.png" alt="Output Image" width="500">
+</p>
 
 # Production-style pure C++/CUDA SDXL runtime
 
