@@ -18,7 +18,9 @@ struct DenoiseOptions {
     float ddim_eta = 0.0F;
     std::uint64_t seed = 0;
     std::vector<std::uint64_t> batch_seeds;
-    SchedulerKind scheduler = SchedulerKind::EulerDiscrete;
+    SamplerKind sampler = SamplerKind::DPMpp2M;
+    SchedulerKind scheduler = SchedulerKind::Normal;
+    SamplerConfig sampler_config{};
     SchedulerConfig scheduler_config{};
     SDXLMicroConditioning positive_micro{};
     std::optional<SDXLMicroConditioning> negative_micro;

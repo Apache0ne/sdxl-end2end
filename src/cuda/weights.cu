@@ -1,4 +1,5 @@
 #include "sdxl/cuda/weights.hpp"
+#include "int8_convrot.hpp"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -181,6 +182,16 @@ __global__ void fill_scale_kernel(float* scales, std::size_t count, float value)
     return value.size() >= prefix.size() && value.substr(0, prefix.size()) == prefix;
 }
 
+[[nodiscard]] bool is_linear_weight(std::string_view logical_name, const TensorView& source) {
+    if (!ends_with(logical_name, ".weight") || source.shape.size() != 2) return false;
+    if (logical_name.find("embeddings.") != std::string_view::npos ||
+        logical_name.find("token_embedding") != std::string_view::npos ||
+        logical_name.find("position_embedding") != std::string_view::npos) {
+        return false;
+    }
+    return true;
+}
+
 [[nodiscard]] SourceType source_type(DType type) {
     switch (type) {
     case DType::F16: return SourceType::F16;
@@ -235,6 +246,10 @@ void update_stats(WeightLoadStats& stats, const Tensor& tensor) {
     switch (tensor.type()) {
     case ScalarType::Float8E4M3: ++stats.fp8_e4m3_tensors; break;
     case ScalarType::Float8E5M2: ++stats.fp8_e5m2_tensors; break;
+    case ScalarType::Int8:
+        ++stats.int8_tensors;
+        if (tensor.uses_convrot()) ++stats.int8_convrot_tensors;
+        break;
     case ScalarType::Float16: ++stats.fp16_tensors; break;
     case ScalarType::Float32: ++stats.fp32_tensors; break;
     case ScalarType::Int32: break;
@@ -650,6 +665,62 @@ void WeightStore::write_fp8_cache(const FP8CacheOptions& cache,
         throw CudaError("cannot install FP8 cache: " + error.message());
     }
     cache_stats.written = true;
+}
+
+WeightLoadStats WeightStore::load_prefixes_int8(
+    const std::vector<std::string>& prefixes,
+    INT8WeightLoadOptions options) {
+    if (model_ == nullptr || runtime_ == nullptr) {
+        throw CudaError("CUDA weight store is not initialized");
+    }
+    if (options.enable_convrot && !valid_convrot_group_size(options.convrot_group_size)) {
+        throw CudaError("INT8 ConvRot group size must be a power of four between 4 and 256");
+    }
+    active_int8_options_ = options;
+    WeightLoadStats stats;
+    for (const auto& [name, slot] : model_->graph().parameter_index()) {
+        bool selected = false;
+        for (const std::string& prefix : prefixes) {
+            if (begins_with(name, prefix)) {
+                selected = true;
+                break;
+            }
+        }
+        if (!selected) continue;
+        if (slot == nullptr || !slot->tensor.has_value()) {
+            throw CudaError("required model weight is not loaded on the host: " + name);
+        }
+        if (tensors_.find(name) != tensors_.end()) continue;
+
+        const TensorView& source = *slot->tensor;
+        const TensorRole role = begins_with(name, "vae.") ? TensorRole::VAE : TensorRole::Model;
+        Tensor destination;
+        if (is_linear_weight(name, source)) {
+            try {
+                const QuantizationMetadata* metadata = slot->quantization.has_value()
+                    ? &*slot->quantization : nullptr;
+                destination = upload_or_quantize_int8_weight(
+                    *runtime_, source, metadata, role, options);
+            } catch (const CudaError&) {
+                if (options.strict || source.dtype == DType::I8) throw;
+                destination = upload_tensor(source, ScalarType::Float16, role);
+            }
+        } else {
+            if (source.dtype == DType::I8) {
+                throw CudaError("INT8 checkpoint contains a non-linear INT8 tensor that cannot be executed natively: " +
+                                name);
+            }
+            destination = upload_tensor(source, ScalarType::Float16, role);
+        }
+
+        stats.source_bytes += static_cast<std::size_t>(source.logical_bytes());
+        stats.device_bytes += resident_bytes(destination);
+        update_stats(stats, destination);
+        device_bytes_ += resident_bytes(destination);
+        tensors_.emplace(name, std::move(destination));
+    }
+    runtime_->synchronize();
+    return stats;
 }
 
 void WeightStore::unload_prefix(std::string_view prefix) {

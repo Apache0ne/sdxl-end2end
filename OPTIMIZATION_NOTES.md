@@ -36,9 +36,15 @@ is present, `cfg<=1` now uses:
 - one prompt batch rather than negative+positive concatenation;
 - one CLIP branch;
 - one UNet batch;
-- direct Euler/DDIM scheduler update without CFG combine.
+- direct sampler update without CFG combine.
 
 This is particularly important for Lightning/Turbo-style low-CFG generation.
+
+## Sampler and scheduler policy
+
+`dpmpp_2m` plus `normal` is the default request policy. Euler and DDIM remain available, and the
+nine sigma schedulers are selected independently. The benchmark CSV records both fields and
+`SAMPLER_SCHEDULER_MATRIX.bat` runs all 66 combinations.
 
 ## Attention
 
@@ -109,7 +115,7 @@ A complete fixed-shape denoising loop is captured after eager plan warmup. cuBLA
 convolution, and cuDNN SDPA plans therefore exist before capture. Stable conditioning and latent
 buffers are updated before replay.
 
-The graph key includes resolution, steps, batch, scheduler, guidance, resolved CFG mode, guidance
+The graph key includes resolution, steps, batch, sampler, scheduler, guidance, resolved CFG mode, guidance
 rescale, and DDIM eta.
 
 ## Linear layers
@@ -134,7 +140,7 @@ The hot path includes:
 - bias + SiLU/GELU/QuickGELU/GEGLU;
 - time-conditioning add + SiLU;
 - Euler scale + CFG repeat;
-- CFG + Euler/DDIM scheduler update;
+- DPM++ 2M update and CFG + Euler/DDIM sampler updates;
 - VAE cast + latent scaling.
 
 ## Remaining target-only work
@@ -148,3 +154,10 @@ benchmarks, the next work should be selected from measured traces:
 - benchmark batch two at 512/768 before attempting batch two at 1024;
 - use Nsight Compute to identify whether the remaining SM86 FP8 projection bottleneck is global
   bandwidth, FP8 conversion, shared-memory pressure, or WMMA occupancy.
+
+
+## Quality-parity execution mode
+
+`--comfyui-parity` deliberately separates solver precision from model precision. The extra FP32 latent/history memory is small relative to resident SDXL weights and avoids repeated half rounding during four-step DPM++ SDE. FP16 conversion occurs only at the UNet boundary, preserving Tensor Core/cuDNN execution. Workflow import defaults model precision to FP16 so FP8 quality can be evaluated as a separate measured change rather than being conflated with sampler parity.
+
+Performance comparisons should report four independent axes: model precision, noise device, sampler-state precision, and startup scaling. A fast configuration may opt into `fp8-auto`, GPU noise, and FP16 state after an FP16/CPU/FP32 reference image is accepted.

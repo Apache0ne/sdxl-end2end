@@ -19,7 +19,7 @@ $env:PATH="The users NVIDIA GPU Computing Toolkit path"
 
 & "The users cmake exe path" --build build-cuda13 --config Release --target sdxl_cuda_denoise --parallel
 
-.\build-cuda13\Release\sdxl_cuda_denoise.exe "The users path to their .safetensors file they are using" 1024 1024 4 1.0 1234 euler "a cinematic photograph of a city at night" "blurry" "output.png" 0 0.0 fp8-auto
+.\build-cuda13\Release\sdxl_cuda_denoise.exe "The users path to their .safetensors file they are using" 1024 1024 4 1.0 1234 "a cinematic photograph of a city at night" "blurry" "output.png" --sampler dpmpp_sde --scheduler normal --denoise 1 --comfyui-parity --memory balanced --precision fp16
 
 ```
 
@@ -36,9 +36,9 @@ The standard SDXL tokenizers are embedded in the executable. A normal run needs 
 - complete single-file/LDM SDXL key conversion
 - Diffusers single-file and sharded component loading
 - embedded CLIP BPE vocabulary and merge table
-- FP16 CLIP-L and OpenCLIP-bigG CUDA execution
-- mixed FP8/FP16 SDXL UNet CUDA execution
-- Euler Discrete and DDIM denoising
+- FP16 or native W8A8 INT8 ConvRot CLIP-L/OpenCLIP-bigG CUDA execution
+- FP16, FP8/FP16, or native INT8/FP16 SDXL UNet CUDA execution
+- DPM++ 2M/SDE, Euler/ancestral, DPM++ 2S CFG++, and DDIM samplers with independent scheduler selection
 - classifier-free guidance and guidance rescaling
 - FP32 force-upcast standard SDXL VAE
 - CUDA RGB8 conversion
@@ -69,12 +69,14 @@ There is no neural-network CPU fallback in the normal target.
 
 | Component | Storage/execution policy |
 |---|---|
-| CLIP-L | FP16 weights and activations |
-| OpenCLIP-bigG | FP16 weights and activations |
-| eligible UNet rank-2 weights | E4M3 or E5M2 FP8 |
+| CLIP-L | FP16, or ConvRot/row-wise INT8 Linear weights with FP16 activations |
+| OpenCLIP-bigG | FP16, or ConvRot/row-wise INT8 Linear weights with FP16 activations |
+| eligible UNet rank-2 weights | E4M3/E5M2 FP8 or W8A8 INT8 ConvRot |
 | UNet convolutions, norms, biases | FP16 |
-| UNet activations, residuals, latents, scheduler, CFG | FP16 |
-| FP8 scale metadata | small FP32 tensors required by FP8 APIs |
+| UNet activations and model I/O | FP16 at the UNet boundary |
+| sampler latent state and solver history | FP32 by default; optional FP16 compatibility mode |
+| initial/stochastic noise | PyTorch-compatible CPU Float32 by default; optional CUDA Philox |
+| FP8/INT8 scale metadata | small FP32 tensors required by quantized kernels |
 | standard SDXL VAE | FP32 because `force_upcast=true` |
 | final image | RGB8 |
 
@@ -96,6 +98,62 @@ fp16
 ```
 
 On SM89 and newer, aligned projections can use native cuBLASLt FP8 Tensor Cores. On SM86 RTX 3060, FP8 weights stay compressed and are decoded tile-by-tile into FP16 WMMA shared memory. The complete UNet is never expanded and retained as FP16 merely to execute a projection.
+
+## INT8 ConvRot profiles
+
+```text
+int8-convrot
+int8-convrot-strict
+int8-convrot-prequantized
+int8-convrot-prequantized-strict
+int8-row
+int8-row-strict
+int8-convrot-unet-only
+```
+
+On RTX 20/30-series GPUs, eligible UNet and CLIP Linear layers use dynamic
+per-row activation quantization, per-output-row weight scales, INT32
+accumulation, and a CUDA dequantization epilogue. ConvRot uses the regular H4
+Kronecker transform with group size 256 by default. Floating checkpoints can be
+quantized when uploaded, or prequantized I8 checkpoints can be loaded directly.
+See [INT8_CONVROT.md](INT8_CONVROT.md).
+
+
+## Samplers and schedulers
+
+The default is `dpmpp_2m` with the `normal` scheduler. The CLI also provides `dpmpp_sde`, `euler`, `euler_ancestral`, `dpmpp_2s_ancestral_cfg_pp`, and `ddim`, independently combinable with `normal`, `karras`, `exponential`, `sgm_uniform`, `simple`, `ddim_uniform`, exact Diffusers-compatible `ddim_trailing`, `beta`, `linear_quadratic`, `kl_optimal`, and exact `gits` scheduling. `--hyper-sdxl` selects DDIM + trailing spacing + zero guidance/eta for fixed 2/4/8-step Hyper-SDXL checkpoints. All sampler/scheduler controls are documented in [SAMPLERS_AND_SCHEDULERS.md](SAMPLERS_AND_SCHEDULERS.md). The positional `steps` value is reused by every scheduler.
+
+### ComfyUI KSampler parity from the CLI
+
+The runtime does not import workflow JSON. Use the normal positional CLI and
+`--comfyui-parity` so every active model, sampler, scheduler, seed, and prompt
+is visible in the command itself:
+
+```powershell
+.\build-cuda13\Release\sdxl_cuda_denoise.exe model.safetensors 1024 1024 4 1.0 788897633613589 `
+  "a cinematic photograph of a city at night" "blurry" output.png `
+  --sampler dpmpp_sde --scheduler normal --denoise 1 `
+  --comfyui-parity --memory balanced --precision fp16
+```
+
+See [COMFYUI_PARITY.md](COMFYUI_PARITY.md).
+
+### Hyper-SDXL fixed-step preset
+
+For a merged fixed-step Hyper-SDXL 2-, 4-, or 8-step checkpoint, use the step
+count matching the distillation target and add `--hyper-sdxl`:
+
+```powershell
+.\build-cuda13\Release\sdxl_cuda_denoise.exe model.safetensors 1024 1024 4 1.0 1234 `
+  "a cinematic photograph of a city at night" "" hyper.png --hyper-sdxl
+```
+
+This selects the official fixed-step recipe: DDIM, exact Diffusers trailing
+timesteps (`999,749,499,249` at four steps), eta zero, guidance zero, no forced
+CFG, and Diffusers-compatible `set_alpha_to_one=true` final handling.
+The preset rejects step counts other than 2, 4, or 8. The unified 1-step
+Hyper-SDXL LoRA uses TCD instead and is not silently treated as this fixed-step
+recipe.
 
 ## Accepted model layouts
 
@@ -178,13 +236,15 @@ Normal Release builds do not scan tensors for NaN/Inf after every stage.
 ```bat
 build-cuda13\Release\sdxl_cuda_denoise.exe ^
   D:\models\myModelXL.safetensors ^
-  1024 1024 30 5.0 1234 euler ^
+  1024 1024 30 5.0 1234 ^
   "a cinematic photograph of a city at night" ^
   "blurry, low quality" ^
   output.png ^
   --memory balanced ^
   --precision fp8-auto ^
   --attention auto ^
+  --sampler dpmpp_2m ^
+  --scheduler normal ^
   --profile ^
   --profile-json output_trace.json
 ```
@@ -227,7 +287,7 @@ Run:
 ```bat
 build-cuda13\Release\sdxl_cuda_denoise.exe ^
   D:\models\myModelXL.safetensors ^
-  1024 1024 30 5.0 1234 euler ^
+  1024 1024 30 5.0 1234 ^
   --jobs jobs.tsv ^
   --memory balanced ^
   --preload ^
@@ -235,7 +295,7 @@ build-cuda13\Release\sdxl_cuda_denoise.exe ^
   --profile
 ```
 
-The first matching request warms cuBLASLt/cuDNN plans and captures the complete fixed-shape denoising loop. Later requests with the same shape, batch, scheduler, step count, CFG, rescale, and eta replay the graph. Prompt buffers and per-image seeded latents are updated before replay.
+The first matching request warms cuBLASLt/cuDNN plans and captures the complete fixed-shape denoising loop. Later requests with the same shape, batch, sampler, scheduler, step count, CFG, rescale, and eta replay the graph. Prompt buffers and per-image seeded latents are updated before replay. CUDA Graph mode requires GPU noise and deterministic sampler noise because a captured graph cannot safely regenerate changing CPU/Brownian streams.
 
 ## Warm server
 
@@ -350,7 +410,8 @@ BENCHMARK_FLASH_CFG1.bat D:\models\myModelXL.safetensors
 - GEMM bias + SiLU/GELU/QuickGELU
 - GEMM bias + GEGLU
 - time-conditioning add + SiLU
-- Euler input scale + CFG batch repeat
+- sigma-space input scale + CFG batch repeat
+- DPM++ 2M predicted-original and multistep update
 - CFG + Euler step
 - CFG + DDIM step
 - VAE FP16-to-FP32 cast + latent scaling
@@ -396,19 +457,37 @@ The PowerShell-backed matrix compares:
 
 - cold FP16 and FP8 process runs
 - 512 and 1024 resolutions
-- Euler and DDIM
+- DPM++ 2M, Euler, and DDIM with the normal schedule
 - persistent balanced mode first and second image
 - CUDA Graph warm replay
 - preloaded server first and second image
 
 Results are stored in `benchmark_results\benchmark.csv`, Chrome traces, and a server log.
 
+Run every sampler/scheduler combination with:
+
+```bat
+SAMPLER_SCHEDULER_MATRIX.bat D:\models\myModelXL.safetensors 512 4
+```
+
 ## Important options
 
 ```text
 --memory low|balanced|high
 --precision PROFILE
+--int8-group-size 4|16|64|256
+--int8-strict
+--int8-prequantized-only
+--int8-unet-only
 --attention auto|cudnn-sdpa|flash-sm80|warp-online
+--sampler dpmpp_2m|dpmpp_sde|euler|euler_ancestral|dpmpp_2s_ancestral_cfg_pp|ddim
+--scheduler normal|karras|exponential|sgm_uniform|simple|ddim_uniform|ddim_trailing|beta|linear_quadratic|kl_optimal|gits
+--hyper-sdxl
+--comfyui-parity
+--noise-device cpu|gpu
+--sampler-state fp32|fp16
+--initial-noise-scaling comfyui|sigma
+--eta F --s-noise F --r F
 --force-cfg
 --preload
 --batch N
@@ -433,25 +512,42 @@ Results are stored in `benchmark_results\benchmark.csv`, Chrome traces, and a se
 
 | File | Purpose |
 |---|---|
+| `src/scheduler.cpp` | sampler algorithms, schedules, PyTorch-compatible CPU RNG, and Brownian interval planning |
 | `src/cuda/engine.cpp` | persistent model engine and memory policies |
 | `src/server_main.cpp` | preloaded stdin server |
 | `src/cuda/profiler.cpp` | asynchronous CUDA event profiler and trace export |
 | `src/cuda/runtime.cpp` | CUDA handles, plan caches, persistent GPU arena |
-| `src/cuda/weights.cu` | uploads and packed FP8 cache |
+| `src/cuda/weights.cu` | floating, FP8, and native INT8 component loading |
+| `src/cuda/int8_convrot.cu` | ConvRot, row-wise W8A8 quantization, cuBLASLt INT8 GEMM, and DP4A fallback |
 | `src/cuda/ops_blas.cpp` | persistent cuBLASLt/cuDNN plans |
 | `src/cuda/ops_kernels.cu` | attention dispatch, fused normalization, CFG, scheduler, and RNG kernels |
 | `src/cuda/flash_attention_sm80.cu` | raw FP16 Tensor Core FlashAttention-style forward kernel |
 | `src/cuda/cudnn_sdpa.cpp` | optional cached NVIDIA cuDNN Frontend SDPA graphs |
 | `src/cuda/fp8_kernels.cu` | K-major SM86 FP8-weight WMMA projection kernel |
 | `src/cuda/denoise_graph.cpp` | reusable complete-loop CUDA Graph |
-| `src/cuda/text_encoder.cpp` | FP16 dual CLIP execution |
-| `src/cuda/unet.cpp` | mixed FP8/FP16 SDXL UNet |
+| `src/cuda/text_encoder.cpp` | FP16-activation dual CLIP execution with FP16 or INT8 Linear weights |
+| `src/cuda/unet.cpp` | FP16, mixed FP8/FP16, or mixed INT8/FP16 SDXL UNet |
 | `src/cuda/vae.cpp` | force-upcast FP32 VAE |
 | `src/cuda/async_image_writer.cpp` | background PNG/raw image output |
 | `BENCHMARK_MATRIX.ps1` | reproducible baseline matrix |
 | `BENCHMARK_FLASH_CFG1.ps1` | CFG bypass and attention backend end-to-end A/B matrix |
 | `ATTENTION_BENCHMARK.bat` | shape-level attention speed and numerical-error comparison |
+| `SAMPLER_SCHEDULER_MATRIX.ps1` | full sampler/scheduler end-to-end matrix, including DDIM trailing |
 
 ## Validation boundary
 
 The source/reference tests and host/CUDA syntax checks can run in the provided development environment. Final `nvcc` linking and GPU execution of the new production paths must be run on the target Windows CUDA 13.3/cuDNN 9.23 machine. See `VALIDATION.md` for the exact completed and pending checks.
+
+
+### Noise device and DPM++ SDE
+
+`--noise-device cpu|gpu` controls both the initial latent noise and all stochastic
+sampler noise. CPU is the default and reproduces the current PyTorch CPU Float32
+MT19937/Box-Muller initial-noise stream used by ComfyUI. GPU mode uses native
+CUDA Philox and is faster but intentionally produces a different seeded image.
+DPM++ SDE uses interval-consistent Brownian increments in raw sigma space,
+matching the default ComfyUI/k-diffusion transform. Its midpoint and full-step
+queries are normalized over one shared elementary path, so overlap has the
+correct covariance. The finite C++ Brownian construction is distributionally
+and interval-wise equivalent for the known query set, but is not promised to be
+bit-for-bit identical to `torchsde.BrownianTree`.

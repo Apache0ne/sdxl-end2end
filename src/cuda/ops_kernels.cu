@@ -764,6 +764,24 @@ __global__ void random_normal_half_kernel(__half* output,
     }
 }
 
+__global__ void random_normal_float_kernel(float* output,
+                                          std::size_t count,
+                                          unsigned long long seed,
+                                          float scale) {
+    const std::size_t group = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t base = group * 4;
+    if (base >= count) return;
+    curandStatePhilox4_32_10_t state;
+    curand_init(seed, static_cast<unsigned long long>(group), 0ULL, &state);
+    const float4 values = curand_normal4(&state);
+    const float samples[4] = {values.x, values.y, values.z, values.w};
+    #pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        const std::size_t index = base + static_cast<std::size_t>(lane);
+        if (index < count) output[index] = samples[lane] * scale;
+    }
+}
+
 __global__ void random_normal_batch_half_kernel(__half* output,
                                                std::size_t per_batch,
                                                std::size_t batch,
@@ -788,6 +806,30 @@ __global__ void random_normal_batch_half_kernel(__half* output,
     }
 }
 
+__global__ void random_normal_batch_float_kernel(float* output,
+                                                std::size_t per_batch,
+                                                std::size_t batch,
+                                                const unsigned long long* seeds,
+                                                float scale) {
+    const std::size_t group = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t groups_per_batch = (per_batch + 3U) / 4U;
+    const std::size_t total_groups = groups_per_batch * batch;
+    if (group >= total_groups) return;
+    const std::size_t batch_index = group / groups_per_batch;
+    const std::size_t local_group = group % groups_per_batch;
+    const std::size_t base = batch_index * per_batch + local_group * 4U;
+    curandStatePhilox4_32_10_t state;
+    curand_init(seeds[batch_index], static_cast<unsigned long long>(local_group), 0ULL, &state);
+    const float4 values = curand_normal4(&state);
+    const float samples[4] = {values.x, values.y, values.z, values.w};
+    #pragma unroll
+    for (int lane = 0; lane < 4; ++lane) {
+        const std::size_t local = local_group * 4U + static_cast<std::size_t>(lane);
+        if (local < per_batch) output[base + static_cast<std::size_t>(lane)] =
+            samples[lane] * scale;
+    }
+}
+
 __global__ void euler_scale_kernel(const __half* sample, __half* output,
                                    std::size_t count, float inverse_scale) {
     const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -807,6 +849,24 @@ __global__ void euler_scale_repeat_kernel(const __half* sample,
     }
 }
 
+__global__ void euler_scale_f32_to_half_kernel(const float* sample, __half* output,
+                                               std::size_t count, float inverse_scale) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) output[index] = __float2half_rn(sample[index] * inverse_scale);
+}
+
+__global__ void euler_scale_repeat_f32_to_half_kernel(const float* sample,
+                                                      __half* output,
+                                                      std::size_t input_count,
+                                                      std::size_t repeats,
+                                                      float inverse_scale) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t count = input_count * repeats;
+    if (index < count) {
+        output[index] = __float2half_rn(sample[index % input_count] * inverse_scale);
+    }
+}
+
 __device__ float cfg_value(const __half* model_output,
                            std::size_t index,
                            std::size_t batch,
@@ -819,6 +879,108 @@ __device__ float cfg_value(const __half* model_output,
     const float conditional =
         __half2float(model_output[(batch + batch_index) * per_batch + local]);
     return unconditional + guidance_scale * (conditional - unconditional);
+}
+
+__global__ void predicted_original_kernel(const __half* model_output,
+                                          const __half* sample,
+                                          __half* output,
+                                          std::size_t count,
+                                          float sigma,
+                                          int prediction_type) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) {
+        const float x = __half2float(sample[index]);
+        const float prediction = __half2float(model_output[index]);
+        float original = 0.0F;
+        if (prediction_type == 0) original = x - sigma * prediction;
+        else if (prediction_type == 1) original = prediction;
+        else original = prediction * (-sigma / sqrtf(sigma * sigma + 1.0F)) +
+                        x / (sigma * sigma + 1.0F);
+        output[index] = __float2half_rn(original);
+    }
+}
+
+__global__ void predicted_original_f16_f32_kernel(const __half* model_output,
+                                                  const float* sample,
+                                                  float* output,
+                                                  std::size_t count,
+                                                  float sigma,
+                                                  int prediction_type) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) {
+        const float x = sample[index];
+        const float prediction = __half2float(model_output[index]);
+        float original = 0.0F;
+        if (prediction_type == 0) original = x - sigma * prediction;
+        else if (prediction_type == 1) original = prediction;
+        else original = prediction * (-sigma / sqrtf(sigma * sigma + 1.0F)) +
+                        x / (sigma * sigma + 1.0F);
+        output[index] = original;
+    }
+}
+
+__global__ void combine_half_kernel(const __half* a, const __half* b,
+                                    const __half* c, const __half* noise,
+                                    __half* output, std::size_t count,
+                                    float ca, float cb, float cc, float cn) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) {
+        float value = ca * __half2float(a[index]);
+        if (b != nullptr) value += cb * __half2float(b[index]);
+        if (c != nullptr) value += cc * __half2float(c[index]);
+        if (noise != nullptr) value += cn * __half2float(noise[index]);
+        output[index] = __float2half_rn(value);
+    }
+}
+
+__global__ void combine_float_kernel(const float* a, const float* b,
+                                     const float* c, const float* noise,
+                                     float* output, std::size_t count,
+                                     float ca, float cb, float cc, float cn) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) {
+        float value = ca * a[index];
+        if (b != nullptr) value += cb * b[index];
+        if (c != nullptr) value += cc * c[index];
+        if (noise != nullptr) value += cn * noise[index];
+        output[index] = value;
+    }
+}
+
+__global__ void dpmpp_2m_step_kernel(const __half* denoised,
+                                     const __half* sample,
+                                     const __half* old_denoised,
+                                     __half* output,
+                                     std::size_t count,
+                                     float sample_coefficient,
+                                     float denoised_coefficient,
+                                     float old_coefficient) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) {
+        const float old_value = old_denoised == nullptr ? 0.0F :
+                                __half2float(old_denoised[index]);
+        const float result = sample_coefficient * __half2float(sample[index]) +
+                             denoised_coefficient * __half2float(denoised[index]) +
+                             old_coefficient * old_value;
+        output[index] = __float2half_rn(result);
+    }
+}
+
+__global__ void dpmpp_2m_step_float_kernel(const float* denoised,
+                                           const float* sample,
+                                           const float* old_denoised,
+                                           float* output,
+                                           std::size_t count,
+                                           float sample_coefficient,
+                                           float denoised_coefficient,
+                                           float old_coefficient) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) {
+        const float old_value = old_denoised == nullptr ? 0.0F : old_denoised[index];
+        output[index] = sample_coefficient * sample[index] +
+                        denoised_coefficient * denoised[index] +
+                        old_coefficient * old_value;
+    }
 }
 
 __global__ void euler_cfg_step_kernel(const __half* model_output,
@@ -866,6 +1028,27 @@ __global__ void euler_step_kernel(const __half* model_output,
     }
 }
 
+__global__ void euler_step_f16_f32_kernel(const __half* model_output,
+                                            const float* sample,
+                                            float* output,
+                                            std::size_t count,
+                                            float sigma,
+                                            float delta_sigma,
+                                            int prediction_type) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) {
+        const float x = sample[index];
+        const float prediction = __half2float(model_output[index]);
+        float original = 0.0F;
+        if (prediction_type == 0) original = x - sigma * prediction;
+        else if (prediction_type == 1) original = prediction;
+        else original = prediction * (-sigma / sqrtf(sigma * sigma + 1.0F)) +
+                        x / (sigma * sigma + 1.0F);
+        const float derivative = sigma == 0.0F ? 0.0F : (x - original) / sigma;
+        output[index] = x + derivative * delta_sigma;
+    }
+}
+
 __global__ void ddim_step_kernel(const __half* model_output,
                                  const __half* sample,
                                  const __half* noise,
@@ -902,6 +1085,42 @@ __global__ void ddim_step_kernel(const __half* model_output,
             result += standard_deviation * __half2float(noise[index]);
         }
         output[index] = __float2half_rn(result);
+    }
+}
+
+__global__ void ddim_step_f16_f32_kernel(const __half* model_output,
+                                           const float* sample,
+                                           const float* noise,
+                                           float* output,
+                                           std::size_t count,
+                                           float alpha_t,
+                                           float alpha_prev,
+                                           float eta,
+                                           int prediction_type) {
+    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index < count) {
+        const float x = sample[index];
+        const float prediction = __half2float(model_output[index]);
+        const float beta_t = 1.0F - alpha_t;
+        float predicted_original = 0.0F;
+        float predicted_epsilon = 0.0F;
+        if (prediction_type == 0) {
+            predicted_original = (x - sqrtf(beta_t) * prediction) / sqrtf(alpha_t);
+            predicted_epsilon = prediction;
+        } else if (prediction_type == 1) {
+            predicted_original = prediction;
+            predicted_epsilon = (x - sqrtf(alpha_t) * predicted_original) / sqrtf(beta_t);
+        } else {
+            predicted_original = sqrtf(alpha_t) * x - sqrtf(beta_t) * prediction;
+            predicted_epsilon = sqrtf(alpha_t) * prediction + sqrtf(beta_t) * x;
+        }
+        const float variance = (1.0F - alpha_prev) / (1.0F - alpha_t) *
+                               (1.0F - alpha_t / alpha_prev);
+        const float std_dev = eta * sqrtf(fmaxf(0.0F, variance));
+        const float direction_scale = sqrtf(fmaxf(0.0F, 1.0F - alpha_prev - std_dev * std_dev));
+        float value = sqrtf(alpha_prev) * predicted_original + direction_scale * predicted_epsilon;
+        if (noise != nullptr && std_dev > 0.0F) value += std_dev * noise[index];
+        output[index] = value;
     }
 }
 
@@ -1308,7 +1527,18 @@ Tensor Ops::cast(const Tensor& input, ScalarType destination_type,
     }
     if (input.type() == destination_type) {
         Tensor output = Tensor::allocate(*runtime_, input.shape(), input.type(), destination_role);
-        output.copy_from(*runtime_, input);
+        // Tensor::copy_from intentionally requires matching semantic roles so that
+        // accidental model/sampler/VAE assignment is rejected. A cast is the
+        // explicit role-conversion boundary, however, and same-dtype casts still
+        // need a real device-to-device payload copy when the role changes (for
+        // example FP32 SamplerState -> FP32 VAE before decode).
+        if (input.role() == destination_role) {
+            output.copy_from(*runtime_, input);
+        } else {
+            validate_same_runtime(input, output);
+            SDXL_CUDA_CHECK(cudaMemcpyAsync(output.data(), input.data(), input.bytes(),
+                                            cudaMemcpyDeviceToDevice, runtime_->stream()));
+        }
         return output;
     }
     Tensor output = Tensor::allocate(*runtime_, input.shape(), destination_type, destination_role);
@@ -1834,36 +2064,181 @@ Tensor Ops::classifier_free_guidance(const Tensor& model_output, std::size_t bat
 }
 
 Tensor Ops::euler_scale_input(const Tensor& sample, float sigma) const {
-    Tensor output = Tensor::allocate(*runtime_, sample.shape(), ScalarType::Float16, sample.role());
+    if (sample.type() != ScalarType::Float16 && sample.type() != ScalarType::Float32) {
+        throw CudaError("CUDA Euler scale expects an FP16 or FP32 tensor");
+    }
+    // The UNet remains FP16/FP8, while ComfyUI-compatible sampler state may
+    // remain FP32. Cast only at the model-input boundary.
+    Tensor output = Tensor::allocate(*runtime_, sample.shape(), ScalarType::Float16, TensorRole::Model);
     const float inverse = 1.0F / std::sqrt(sigma * sigma + 1.0F);
-    euler_scale_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
-        sample.half_data(), output.half_data(), sample.elements(), inverse);
+    if (sample.type() == ScalarType::Float16) {
+        euler_scale_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
+            sample.half_data(), output.half_data(), sample.elements(), inverse);
+    } else {
+        euler_scale_f32_to_half_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
+            sample.float_data(), output.half_data(), sample.elements(), inverse);
+    }
     SDXL_CUDA_CHECK(cudaGetLastError());
     return output;
 }
 
 Tensor Ops::euler_scale_repeat_input(const Tensor& sample, float sigma,
                                             std::size_t repeats) const {
-    if (sample.type() != ScalarType::Float16 || sample.rank() == 0 || repeats == 0) {
-        throw CudaError("CUDA Euler scale+repeat expects an FP16 tensor and positive repeat count");
+    if ((sample.type() != ScalarType::Float16 && sample.type() != ScalarType::Float32) ||
+        sample.rank() == 0 || repeats == 0) {
+        throw CudaError("CUDA Euler scale+repeat expects FP16/FP32 input and positive repeat count");
     }
     std::vector<std::size_t> shape = sample.shape();
     shape[0] *= repeats;
-    Tensor output = Tensor::allocate(*runtime_, shape, ScalarType::Float16, sample.role());
+    Tensor output = Tensor::allocate(*runtime_, shape, ScalarType::Float16, TensorRole::Model);
     const float inverse = 1.0F / std::sqrt(sigma * sigma + 1.0F);
-    euler_scale_repeat_kernel<<<blocks_for(output.elements()), kThreads, 0, runtime_->stream()>>>(
-        sample.half_data(), output.half_data(), sample.elements(), repeats, inverse);
+    if (sample.type() == ScalarType::Float16) {
+        euler_scale_repeat_kernel<<<blocks_for(output.elements()), kThreads, 0, runtime_->stream()>>>(
+            sample.half_data(), output.half_data(), sample.elements(), repeats, inverse);
+    } else {
+        euler_scale_repeat_f32_to_half_kernel<<<blocks_for(output.elements()), kThreads, 0, runtime_->stream()>>>(
+            sample.float_data(), output.half_data(), sample.elements(), repeats, inverse);
+    }
+    SDXL_CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+Tensor Ops::predicted_original(const Tensor& model_output, const Tensor& sample,
+                               float sigma, int prediction_type) const {
+    if (model_output.type() != ScalarType::Float16 ||
+        (sample.type() != ScalarType::Float16 && sample.type() != ScalarType::Float32) ||
+        model_output.shape() != sample.shape()) {
+        throw CudaError("CUDA predicted-original conversion expects FP16 model output and matching FP16/FP32 state");
+    }
+    Tensor output = Tensor::allocate(*runtime_, sample.shape(), sample.type(), sample.role());
+    if (sample.type() == ScalarType::Float16) {
+        predicted_original_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
+            model_output.half_data(), sample.half_data(), output.half_data(), sample.elements(),
+            sigma, prediction_type);
+    } else {
+        predicted_original_f16_f32_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
+            model_output.half_data(), sample.float_data(), output.float_data(), sample.elements(),
+            sigma, prediction_type);
+    }
+    SDXL_CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+Tensor Ops::batch_slice(const Tensor& input, std::size_t start_batch,
+                              std::size_t batch_count) const {
+    if (input.type() != ScalarType::Float16 || input.rank() == 0 || batch_count == 0 ||
+        start_batch + batch_count > input.size(0)) {
+        throw CudaError("CUDA batch_slice received an invalid FP16 batch range");
+    }
+    std::vector<std::size_t> shape = input.shape();
+    shape[0] = batch_count;
+    Tensor output = Tensor::allocate(*runtime_, shape, ScalarType::Float16, input.role());
+    const std::size_t per_batch = input.elements() / input.size(0);
+    SDXL_CUDA_CHECK(cudaMemcpyAsync(output.data(), input.half_data() + start_batch * per_batch,
+                                   output.bytes(), cudaMemcpyDeviceToDevice, runtime_->stream()));
+    return output;
+}
+
+Tensor Ops::combine(const Tensor& a, float ca, const Tensor* b, float cb,
+                    const Tensor* c, float cc, const Tensor* noise, float cn) const {
+    if (a.type() != ScalarType::Float16 && a.type() != ScalarType::Float32) {
+        throw CudaError("CUDA combine expects FP16 or FP32 tensors");
+    }
+    auto valid = [&](const Tensor* value) {
+        return value == nullptr || (value->type() == a.type() && value->shape() == a.shape());
+    };
+    if (!valid(b) || !valid(c) || !valid(noise)) throw CudaError("CUDA combine tensor shape/type mismatch");
+    Tensor output = Tensor::allocate(*runtime_, a.shape(), a.type(), a.role());
+    if (a.type() == ScalarType::Float16) {
+        combine_half_kernel<<<blocks_for(a.elements()), kThreads, 0, runtime_->stream()>>>(
+            a.half_data(), b == nullptr ? nullptr : b->half_data(),
+            c == nullptr ? nullptr : c->half_data(), noise == nullptr ? nullptr : noise->half_data(),
+            output.half_data(), a.elements(), ca, cb, cc, cn);
+    } else {
+        combine_float_kernel<<<blocks_for(a.elements()), kThreads, 0, runtime_->stream()>>>(
+            a.float_data(), b == nullptr ? nullptr : b->float_data(),
+            c == nullptr ? nullptr : c->float_data(), noise == nullptr ? nullptr : noise->float_data(),
+            output.float_data(), a.elements(), ca, cb, cc, cn);
+    }
+    SDXL_CUDA_CHECK(cudaGetLastError());
+    return output;
+}
+
+Tensor Ops::dpmpp_2m_step(const Tensor& denoised, const Tensor& sample,
+                          const Tensor* old_denoised, float sigma,
+                          float sigma_next, float sigma_previous) const {
+    if ((sample.type() != ScalarType::Float16 && sample.type() != ScalarType::Float32) ||
+        denoised.type() != sample.type() || denoised.shape() != sample.shape() ||
+        (old_denoised != nullptr &&
+         (old_denoised->type() != sample.type() ||
+          old_denoised->shape() != sample.shape()))) {
+        throw CudaError("CUDA DPM++ 2M step expects matching FP16 or FP32 tensors");
+    }
+    if (!(sigma > 0.0F) || sigma_next < 0.0F) {
+        throw CudaError("CUDA DPM++ 2M step received invalid sigmas");
+    }
+
+    float sample_coefficient = 0.0F;
+    float denoised_coefficient = 1.0F;
+    float old_coefficient = 0.0F;
+    if (sigma_next > 0.0F) {
+        const double ratio = static_cast<double>(sigma_next) / static_cast<double>(sigma);
+        sample_coefficient = static_cast<float>(ratio);
+        denoised_coefficient = static_cast<float>(1.0 - ratio);
+        if (old_denoised != nullptr) {
+            if (!(sigma_previous > sigma)) {
+                throw CudaError("CUDA DPM++ 2M history sigma must exceed the current sigma");
+            }
+            const double time = -std::log(static_cast<double>(sigma));
+            const double time_next = -std::log(static_cast<double>(sigma_next));
+            const double time_previous = -std::log(static_cast<double>(sigma_previous));
+            const double step_size = time_next - time;
+            const double previous_step_size = time - time_previous;
+            const double history_ratio = previous_step_size / step_size;
+            if (!(history_ratio > 0.0) || !std::isfinite(history_ratio)) {
+                throw CudaError("CUDA DPM++ 2M history ratio is invalid");
+            }
+            denoised_coefficient = static_cast<float>(
+                (1.0 - ratio) * (1.0 + 1.0 / (2.0 * history_ratio)));
+            old_coefficient = static_cast<float>(
+                -(1.0 - ratio) / (2.0 * history_ratio));
+        }
+    }
+
+    Tensor output = Tensor::allocate(*runtime_, sample.shape(), sample.type(), sample.role());
+    if (sample.type() == ScalarType::Float16) {
+        dpmpp_2m_step_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
+            denoised.half_data(), sample.half_data(),
+            old_denoised == nullptr ? nullptr : old_denoised->half_data(),
+            output.half_data(), sample.elements(), sample_coefficient,
+            denoised_coefficient, old_coefficient);
+    } else {
+        dpmpp_2m_step_float_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
+            denoised.float_data(), sample.float_data(),
+            old_denoised == nullptr ? nullptr : old_denoised->float_data(),
+            output.float_data(), sample.elements(), sample_coefficient,
+            denoised_coefficient, old_coefficient);
+    }
     SDXL_CUDA_CHECK(cudaGetLastError());
     return output;
 }
 
 Tensor Ops::euler_step(const Tensor& model_output, const Tensor& sample,
                        float sigma, float sigma_next, int prediction_type) const {
-    if (model_output.shape() != sample.shape()) throw CudaError("CUDA Euler step shape mismatch");
-    Tensor output = Tensor::allocate(*runtime_, sample.shape(), ScalarType::Float16, sample.role());
-    euler_step_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
-        model_output.half_data(), sample.half_data(), output.half_data(), sample.elements(),
-        sigma, sigma_next - sigma, prediction_type);
+    if (model_output.type() != ScalarType::Float16 || model_output.shape() != sample.shape() ||
+        (sample.type() != ScalarType::Float16 && sample.type() != ScalarType::Float32)) {
+        throw CudaError("CUDA Euler step expects FP16 model output and matching FP16/FP32 state");
+    }
+    Tensor output = Tensor::allocate(*runtime_, sample.shape(), sample.type(), sample.role());
+    if (sample.type() == ScalarType::Float16) {
+        euler_step_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
+            model_output.half_data(), sample.half_data(), output.half_data(), sample.elements(),
+            sigma, sigma_next - sigma, prediction_type);
+    } else {
+        euler_step_f16_f32_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
+            model_output.half_data(), sample.float_data(), output.float_data(), sample.elements(),
+            sigma, sigma_next - sigma, prediction_type);
+    }
     SDXL_CUDA_CHECK(cudaGetLastError());
     return output;
 }
@@ -1895,13 +2270,21 @@ Tensor Ops::euler_cfg_step(const Tensor& model_output, const Tensor& sample,
 Tensor Ops::ddim_step(const Tensor& model_output, const Tensor& sample,
                       float alpha_t, float alpha_prev, float eta,
                       int prediction_type, const Tensor* noise) const {
-    if (model_output.shape() != sample.shape() || (noise != nullptr && noise->shape() != sample.shape())) {
-        throw CudaError("CUDA DDIM step shape mismatch");
+    if (model_output.type() != ScalarType::Float16 || model_output.shape() != sample.shape() ||
+        (sample.type() != ScalarType::Float16 && sample.type() != ScalarType::Float32) ||
+        (noise != nullptr && (noise->shape() != sample.shape() || noise->type() != sample.type()))) {
+        throw CudaError("CUDA DDIM step expects FP16 model output and matching FP16/FP32 state/noise");
     }
-    Tensor output = Tensor::allocate(*runtime_, sample.shape(), ScalarType::Float16, sample.role());
-    ddim_step_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
-        model_output.half_data(), sample.half_data(), noise == nullptr ? nullptr : noise->half_data(),
-        output.half_data(), sample.elements(), alpha_t, alpha_prev, eta, prediction_type);
+    Tensor output = Tensor::allocate(*runtime_, sample.shape(), sample.type(), sample.role());
+    if (sample.type() == ScalarType::Float16) {
+        ddim_step_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
+            model_output.half_data(), sample.half_data(), noise == nullptr ? nullptr : noise->half_data(),
+            output.half_data(), sample.elements(), alpha_t, alpha_prev, eta, prediction_type);
+    } else {
+        ddim_step_f16_f32_kernel<<<blocks_for(sample.elements()), kThreads, 0, runtime_->stream()>>>(
+            model_output.half_data(), sample.float_data(), noise == nullptr ? nullptr : noise->float_data(),
+            output.float_data(), sample.elements(), alpha_t, alpha_prev, eta, prediction_type);
+    }
     SDXL_CUDA_CHECK(cudaGetLastError());
     return output;
 }
@@ -1932,31 +2315,44 @@ Tensor Ops::ddim_cfg_step(const Tensor& model_output, const Tensor& sample,
     return output;
 }
 
-Tensor Ops::random_normal(std::vector<std::size_t> shape, std::uint64_t seed, float scale) const {
-    Tensor output = Tensor::allocate(*runtime_, std::move(shape), ScalarType::Float16, TensorRole::Model);
+Tensor Ops::random_normal(std::vector<std::size_t> shape, std::uint64_t seed, float scale,
+                          ScalarType type, TensorRole role) const {
+    if (type != ScalarType::Float16 && type != ScalarType::Float32) {
+        throw CudaError("CUDA random_normal supports only FP16 and FP32");
+    }
+    Tensor output = Tensor::allocate(*runtime_, std::move(shape), type, role);
     random_normal_into(output, seed, scale);
     return output;
 }
 
 void Ops::random_normal_into(Tensor& output, std::uint64_t seed, float scale) const {
-    if (runtime_ == nullptr || output.type() != ScalarType::Float16 ||
-        output.role() != TensorRole::Model || output.runtime_state() != runtime_->state()) {
-        throw CudaError("CUDA random_normal_into expects a runtime-owned FP16 model tensor");
+    if (runtime_ == nullptr ||
+        (output.type() != ScalarType::Float16 && output.type() != ScalarType::Float32) ||
+        (output.role() != TensorRole::Model && output.role() != TensorRole::SamplerState) ||
+        output.runtime_state() != runtime_->state()) {
+        throw CudaError("CUDA random_normal_into expects a runtime-owned FP16/FP32 model or sampler-state tensor");
     }
     const std::size_t count = output.elements();
     const std::size_t groups = (count + 3U) / 4U;
-    random_normal_half_kernel<<<blocks_for(groups), kThreads, 0, runtime_->stream()>>>(
-        output.half_data(), count, static_cast<unsigned long long>(seed), scale);
+    if (output.type() == ScalarType::Float16) {
+        random_normal_half_kernel<<<blocks_for(groups), kThreads, 0, runtime_->stream()>>>(
+            output.half_data(), count, static_cast<unsigned long long>(seed), scale);
+    } else {
+        random_normal_float_kernel<<<blocks_for(groups), kThreads, 0, runtime_->stream()>>>(
+            output.float_data(), count, static_cast<unsigned long long>(seed), scale);
+    }
     SDXL_CUDA_CHECK(cudaGetLastError());
 }
 
 void Ops::random_normal_batch_into(Tensor& output,
                                    std::span<const std::uint64_t> seeds,
                                    float scale) const {
-    if (runtime_ == nullptr || output.type() != ScalarType::Float16 ||
-        output.role() != TensorRole::Model || output.runtime_state() != runtime_->state() ||
-        output.rank() == 0 || seeds.empty() || output.size(0) != seeds.size()) {
-        throw CudaError("CUDA random_normal_batch_into expects FP16 [batch,...] output and one seed per batch item");
+    if (runtime_ == nullptr ||
+        (output.type() != ScalarType::Float16 && output.type() != ScalarType::Float32) ||
+        (output.role() != TensorRole::Model && output.role() != TensorRole::SamplerState) ||
+        output.runtime_state() != runtime_->state() || output.rank() == 0 || seeds.empty() ||
+        output.size(0) != seeds.size()) {
+        throw CudaError("CUDA random_normal_batch_into expects FP16/FP32 model/sampler-state [batch,...] output and one seed per batch item");
     }
     std::vector<std::int32_t> seed_words(seeds.size() * 2);
     for (std::size_t index = 0; index < seeds.size(); ++index) {
@@ -1967,9 +2363,15 @@ void Ops::random_normal_batch_into(Tensor& output,
         *runtime_, {seeds.size(), 2}, seed_words);
     const std::size_t per_batch = output.elements() / output.size(0);
     const std::size_t groups = ((per_batch + 3U) / 4U) * output.size(0);
-    random_normal_batch_half_kernel<<<blocks_for(groups), kThreads, 0, runtime_->stream()>>>(
-        output.half_data(), per_batch, output.size(0),
-        reinterpret_cast<const unsigned long long*>(device_seeds.data()), scale);
+    if (output.type() == ScalarType::Float16) {
+        random_normal_batch_half_kernel<<<blocks_for(groups), kThreads, 0, runtime_->stream()>>>(
+            output.half_data(), per_batch, output.size(0),
+            reinterpret_cast<const unsigned long long*>(device_seeds.data()), scale);
+    } else {
+        random_normal_batch_float_kernel<<<blocks_for(groups), kThreads, 0, runtime_->stream()>>>(
+            output.float_data(), per_batch, output.size(0),
+            reinterpret_cast<const unsigned long long*>(device_seeds.data()), scale);
+    }
     SDXL_CUDA_CHECK(cudaGetLastError());
 }
 

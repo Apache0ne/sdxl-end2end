@@ -120,6 +120,73 @@ void validate_initial_latents(const FloatTensor& latents,
     if (latents.values.size() != count) throw Error("initial latent storage is inconsistent");
 }
 
+
+[[nodiscard]] FloatTensor scaled_input(const FloatTensor& sample, float sigma) {
+    FloatTensor result{sample.shape, sample.values};
+    const float scale = 1.0F / std::sqrt(1.0F + sigma * sigma);
+    for (float& value : result.values) value *= scale;
+    return result;
+}
+
+[[nodiscard]] FloatTensor predicted_original(const FloatTensor& prediction,
+                                             const FloatTensor& sample,
+                                             float sigma,
+                                             PredictionType type) {
+    if (prediction.shape != sample.shape || prediction.values.size() != sample.values.size()) {
+        throw Error("prediction and sample shapes differ");
+    }
+    FloatTensor result{sample.shape, std::vector<float>(sample.values.size())};
+    const float alpha = 1.0F / std::sqrt(1.0F + sigma * sigma);
+    const float beta = sigma * alpha;
+    for (std::size_t i = 0; i < result.values.size(); ++i) {
+        switch (type) {
+        case PredictionType::Epsilon:
+            result.values[i] = sample.values[i] - sigma * prediction.values[i];
+            break;
+        case PredictionType::Sample:
+            result.values[i] = prediction.values[i];
+            break;
+        case PredictionType::VPrediction:
+            result.values[i] = alpha * sample.values[i] - beta * prediction.values[i];
+            break;
+        }
+    }
+    return result;
+}
+
+
+void add_scaled_noise(FloatTensor& sample, const FloatTensor& noise, float scale) {
+    if (sample.shape != noise.shape || sample.values.size() != noise.values.size()) {
+        throw Error("noise and sample shapes differ");
+    }
+    for (std::size_t i = 0; i < sample.values.size(); ++i) sample.values[i] += scale * noise.values[i];
+}
+
+[[nodiscard]] FloatTensor deterministic_noise(const std::vector<std::size_t>& shape,
+                                              std::uint64_t seed,
+                                              std::size_t step,
+                                              std::uint64_t stage) {
+    return random_normal_tensor(shape, seed ^ (0x9E3779B97F4A7C15ULL * (step + 1)) ^ stage);
+}
+
+[[nodiscard]] FloatTensor brownian_noise(const BrownianIntervalPlan& plan,
+                                           const std::vector<std::size_t>& shape,
+                                           std::uint64_t seed,
+                                           float sigma_from,
+                                           float sigma_to) {
+    std::size_t count = 1;
+    for (const std::size_t dimension : shape) count *= dimension;
+    FloatTensor result{shape, std::vector<float>(count, 0.0F)};
+    for (const BrownianIntervalWeight& weight : plan.weights(sigma_from, sigma_to)) {
+        const FloatTensor component = random_normal_tensor(
+            shape, brownian_interval_seed(seed, weight.interval_index));
+        for (std::size_t index = 0; index < result.values.size(); ++index) {
+            result.values[index] += weight.coefficient * component.values[index];
+        }
+    }
+    return result;
+}
+
 } // namespace
 
 SDXLDenoiser::SDXLDenoiser(const SDXLModel& model,
@@ -141,10 +208,19 @@ SDXLDenoiseResult SDXLDenoiser::denoise(
         {batch, 4, options.height / 8, options.width / 8}, options.seed);
 
     float initial_sigma = 1.0F;
-    if (options.scheduler == SchedulerKind::EulerDiscrete) {
-        EulerDiscreteScheduler scheduler(options.scheduler_config);
-        scheduler.set_timesteps(options.inference_steps);
-        initial_sigma = scheduler.initial_noise_sigma();
+    if (options.sampler != SamplerKind::DDIM) {
+        SigmaSchedule schedule(options.scheduler_config);
+        schedule.set_timesteps(options.inference_steps, options.scheduler);
+        initial_sigma = schedule.initial_noise_sigma();
+        const float model_sigma_max = schedule.training_sigmas().back();
+        const float comparison_scale = std::max(
+            {1.0F, std::abs(initial_sigma), std::abs(model_sigma_max)});
+        const bool max_denoise = initial_sigma > model_sigma_max ||
+            std::abs(initial_sigma - model_sigma_max) <= 1.0e-5F * comparison_scale;
+        if (max_denoise && options.sampler_config.initial_noise_scaling ==
+                InitialNoiseScaling::ComfyUIMaxDenoise) {
+            initial_sigma = std::sqrt(1.0F + initial_sigma * initial_sigma);
+        }
     }
     for (float& value : initial.values) value *= initial_sigma;
     return denoise_from_latents(conditioning, std::move(initial), std::move(options));
@@ -195,67 +271,203 @@ SDXLDenoiseResult SDXLDenoiser::denoise_from_latents(
     std::vector<float> used_timesteps;
     std::mt19937_64 ddim_generator(options.seed ^ 0x9E3779B97F4A7C15ULL);
 
-    if (options.scheduler == SchedulerKind::EulerDiscrete) {
-        EulerDiscreteScheduler scheduler(options.scheduler_config);
-        scheduler.set_timesteps(options.inference_steps);
-        used_timesteps = scheduler.timesteps();
+    if (!std::isfinite(options.sampler_config.eta) || options.sampler_config.eta < 0.0F ||
+        !std::isfinite(options.sampler_config.s_noise) || options.sampler_config.s_noise < 0.0F ||
+        !std::isfinite(options.sampler_config.r) || options.sampler_config.r <= 0.0F ||
+        options.sampler_config.r > 1.0F || !std::isfinite(options.sampler_config.s_churn) ||
+        options.sampler_config.s_churn < 0.0F || !std::isfinite(options.sampler_config.s_tmin) ||
+        !std::isfinite(options.sampler_config.s_tmax) || options.sampler_config.s_tmax < options.sampler_config.s_tmin) {
+        throw Error("sampler controls are invalid");
+    }
+
+    struct Predictions { FloatTensor conditional; FloatTensor unconditional; FloatTensor guided; };
+    auto predict = [&](const FloatTensor& sample, float sigma, float timestep, bool require_unconditional) {
+        FloatTensor input = scaled_input(sample, sigma);
+        Predictions output;
+        output.conditional = unet_.forward(input, timestep, positive_prompt, positive_pooled, positive_time_ids);
+        if (require_unconditional || options.guidance_scale > 1.0F) {
+            output.unconditional = unet_.forward(input, timestep,
+                conditioning.negative.prompt_embeds,
+                conditioning.negative.pooled_prompt_embeds,
+                negative_time_ids);
+            output.guided = classifier_free_guidance(output.unconditional, output.conditional,
+                                                     options.guidance_scale);
+            apply_guidance_rescale(output.guided, output.conditional, options.guidance_rescale);
+        } else {
+            output.unconditional = output.conditional;
+            output.guided = output.conditional;
+        }
+        return output;
+    };
+
+    SigmaSchedule sigma_schedule(options.scheduler_config);
+    sigma_schedule.set_timesteps(options.inference_steps, options.scheduler);
+    used_timesteps = sigma_schedule.timesteps();
+    const auto& sigmas = sigma_schedule.sigmas();
+
+    if (options.sampler == SamplerKind::DPMpp2M) {
+        DPMpp2MSampler sampler(options.scheduler_config);
+        sampler.set_timesteps(options.inference_steps, options.scheduler);
+        used_timesteps = sampler.timesteps();
         for (std::size_t step = 0; step < used_timesteps.size(); ++step) {
-            const float timestep = used_timesteps[step];
-            FloatTensor model_input = scheduler.scale_model_input(latents, step);
-            FloatTensor conditional = unet_.forward(model_input,
-                                                    timestep,
-                                                    positive_prompt,
-                                                    positive_pooled,
-                                                    positive_time_ids);
-            FloatTensor prediction;
-            if (options.guidance_scale > 1.0F) {
-                FloatTensor unconditional = unet_.forward(
-                    model_input,
-                    timestep,
-                    conditioning.negative.prompt_embeds,
-                    conditioning.negative.pooled_prompt_embeds,
-                    negative_time_ids);
-                prediction = classifier_free_guidance(
-                    unconditional, conditional, options.guidance_scale);
-                apply_guidance_rescale(prediction, conditional, options.guidance_rescale);
-            } else {
-                prediction = std::move(conditional);
+            FloatTensor input = sampler.scale_model_input(latents, step);
+            Predictions p = predict(latents, sampler.sigmas()[step], used_timesteps[step], false);
+            (void)input;
+            latents = sampler.step(p.guided, step, latents);
+            if (options.progress) options.progress(step + 1, used_timesteps.size(), used_timesteps[step], latents);
+        }
+    } else if (options.sampler == SamplerKind::Euler) {
+        for (std::size_t step = 0; step < used_timesteps.size(); ++step) {
+            const float sigma = sigmas[step];
+            const float gamma = options.sampler_config.s_churn > 0.0F &&
+                sigma >= options.sampler_config.s_tmin && sigma <= options.sampler_config.s_tmax
+                ? std::min(options.sampler_config.s_churn / static_cast<float>(used_timesteps.size()),
+                           std::sqrt(2.0F) - 1.0F) : 0.0F;
+            const float sigma_hat = sigma * (1.0F + gamma);
+            if (gamma > 0.0F) {
+                const float noise_scale = std::sqrt(std::max(0.0F, sigma_hat * sigma_hat - sigma * sigma)) *
+                                          options.sampler_config.s_noise;
+                add_scaled_noise(latents, deterministic_noise(latents.shape, options.seed, step, 0xECULL), noise_scale);
             }
-            latents = scheduler.step(prediction, step, latents);
-            if (options.progress) options.progress(step + 1, used_timesteps.size(), timestep, latents);
+            Predictions p = predict(latents, sigma_hat, gamma > 0.0F ? sigma_schedule.timestep_for(sigma_hat) : used_timesteps[step], false);
+            FloatTensor denoised = predicted_original(p.guided, latents, sigma_hat, options.scheduler_config.prediction_type);
+            for (std::size_t i=0;i<latents.values.size();++i) {
+                const float d=(latents.values[i]-denoised.values[i])/sigma_hat;
+                latents.values[i] += d*(sigmas[step+1]-sigma_hat);
+            }
+            if (options.progress) options.progress(step + 1, used_timesteps.size(), used_timesteps[step], latents);
+        }
+    } else if (options.sampler == SamplerKind::EulerAncestral) {
+        for (std::size_t step = 0; step < used_timesteps.size(); ++step) {
+            const float sigma = sigmas[step], sigma_next = sigmas[step + 1];
+            Predictions p = predict(latents, sigma, used_timesteps[step], false);
+            FloatTensor denoised = predicted_original(p.guided, latents, sigma, options.scheduler_config.prediction_type);
+            const auto ancestral = make_ancestral_step(sigma, sigma_next, options.sampler_config.eta);
+            if (ancestral.down == 0.0F) latents = std::move(denoised);
+            else {
+                for (std::size_t i=0;i<latents.values.size();++i) {
+                    const float d=(latents.values[i]-denoised.values[i])/sigma;
+                    latents.values[i] += d*(ancestral.down-sigma);
+                }
+                if (ancestral.up > 0.0F && options.sampler_config.s_noise > 0.0F) {
+                    add_scaled_noise(latents, deterministic_noise(latents.shape, options.seed, step, 0xEAULL),
+                                     ancestral.up*options.sampler_config.s_noise);
+                }
+            }
+            if (options.progress) options.progress(step + 1, used_timesteps.size(), used_timesteps[step], latents);
+        }
+    } else if (options.sampler == SamplerKind::DPMppSDE) {
+        std::vector<DPMppSDEStage> stages(used_timesteps.size());
+        std::vector<float> brownian_points;
+        brownian_points.reserve(used_timesteps.size() * 3);
+        for (std::size_t step = 0; step < used_timesteps.size(); ++step) {
+            const float sigma = sigmas[step];
+            const float sigma_next = sigmas[step + 1];
+            if (sigma_next == 0.0F) continue;
+            stages[step] = make_dpmpp_sde_stage(
+                sigma, sigma_next, options.sampler_config.eta,
+                options.sampler_config.r);
+            brownian_points.push_back(sigma);
+            brownian_points.push_back(stages[step].sigma_mid);
+            brownian_points.push_back(sigma_next);
+        }
+        std::optional<BrownianIntervalPlan> brownian_plan;
+        if (brownian_points.size() >= 2) {
+            brownian_plan.emplace(std::move(brownian_points));
+        }
+
+        for (std::size_t step = 0; step < used_timesteps.size(); ++step) {
+            const float sigma = sigmas[step];
+            const float sigma_next = sigmas[step + 1];
+            Predictions first_prediction = predict(
+                latents, sigma, used_timesteps[step], false);
+            FloatTensor first_denoised = predicted_original(
+                first_prediction.guided, latents, sigma,
+                options.scheduler_config.prediction_type);
+            if (sigma_next == 0.0F) {
+                latents = std::move(first_denoised);
+            } else {
+                const DPMppSDEStage& stage = stages[step];
+                FloatTensor midpoint{
+                    latents.shape, std::vector<float>(latents.values.size())};
+                for (std::size_t index = 0; index < midpoint.values.size(); ++index) {
+                    midpoint.values[index] =
+                        stage.midpoint_sample_coefficient * latents.values[index] +
+                        stage.midpoint_denoised_coefficient * first_denoised.values[index];
+                }
+                if (stage.midpoint.up > 0.0F &&
+                    options.sampler_config.s_noise > 0.0F) {
+                    if (!brownian_plan.has_value()) {
+                        throw Error("DPM++ SDE Brownian interval plan is unavailable");
+                    }
+                    add_scaled_noise(
+                        midpoint,
+                        brownian_noise(*brownian_plan, midpoint.shape, options.seed,
+                                       sigma, stage.sigma_mid),
+                        stage.midpoint.up * options.sampler_config.s_noise);
+                }
+
+                Predictions second_prediction = predict(
+                    midpoint, stage.sigma_mid,
+                    sigma_schedule.timestep_for(stage.sigma_mid), false);
+                FloatTensor second_denoised = predicted_original(
+                    second_prediction.guided, midpoint, stage.sigma_mid,
+                    options.scheduler_config.prediction_type);
+
+                for (std::size_t index = 0; index < latents.values.size(); ++index) {
+                    const float denoised_mix =
+                        stage.first_denoised_mix * first_denoised.values[index] +
+                        stage.second_denoised_mix * second_denoised.values[index];
+                    latents.values[index] =
+                        stage.final_sample_coefficient * latents.values[index] +
+                        stage.final_denoised_coefficient * denoised_mix;
+                }
+                if (stage.final.up > 0.0F &&
+                    options.sampler_config.s_noise > 0.0F) {
+                    if (!brownian_plan.has_value()) {
+                        throw Error("DPM++ SDE Brownian interval plan is unavailable");
+                    }
+                    add_scaled_noise(
+                        latents,
+                        brownian_noise(*brownian_plan, latents.shape, options.seed,
+                                       sigma, sigma_next),
+                        stage.final.up * options.sampler_config.s_noise);
+                }
+            }
+            if (options.progress) {
+                options.progress(step + 1, used_timesteps.size(),
+                                 used_timesteps[step], latents);
+            }
+        }
+    } else if (options.sampler == SamplerKind::DPMpp2SAncestralCFGpp) {
+        for (std::size_t step=0; step<used_timesteps.size(); ++step) {
+            const float sigma=sigmas[step], sigma_next=sigmas[step+1];
+            Predictions p1=predict(latents,sigma,used_timesteps[step],true);
+            FloatTensor guided=predicted_original(p1.guided,latents,sigma,options.scheduler_config.prediction_type);
+            FloatTensor uncond=predicted_original(p1.unconditional,latents,sigma,options.scheduler_config.prediction_type);
+            auto a=make_ancestral_step(sigma,sigma_next,options.sampler_config.eta);
+            if(a.down==0.0F) latents=std::move(guided);
+            else {
+                const double t=-std::log(sigma), tn=-std::log(a.down), h=tn-t, r=0.5, sm=std::exp(-(t+r*h));
+                FloatTensor x2{latents.shape,std::vector<float>(latents.values.size())};
+                const double ratio=sm/sigma, c=-std::expm1(-h*r);
+                for(size_t i=0;i<x2.values.size();++i) x2.values[i]=static_cast<float>(ratio*(latents.values[i]+guided.values[i]-uncond.values[i])+c*guided.values[i]);
+                Predictions p2=predict(x2,static_cast<float>(sm),static_cast<float>(0.5*(used_timesteps[step]+(step+1<used_timesteps.size()?used_timesteps[step+1]:0.0F))),true);
+                FloatTensor guided2=predicted_original(p2.guided,x2,static_cast<float>(sm),options.scheduler_config.prediction_type);
+                const double ratio2=a.down/sigma, c2=-std::expm1(-h);
+                for(size_t i=0;i<latents.values.size();++i) latents.values[i]=static_cast<float>(ratio2*(latents.values[i]+guided.values[i]-uncond.values[i])+c2*guided2.values[i]);
+                if(a.up>0 && options.sampler_config.s_noise>0) add_scaled_noise(latents,deterministic_noise(latents.shape,options.seed,step,0x2AULL),a.up*options.sampler_config.s_noise);
+            }
+            if(options.progress) options.progress(step+1,used_timesteps.size(),used_timesteps[step],latents);
         }
     } else {
-        DDIMScheduler scheduler(options.scheduler_config);
-        scheduler.set_timesteps(options.inference_steps);
-        used_timesteps = scheduler.timesteps();
+        DDIMScheduler sampler(options.scheduler_config);
+        sampler.set_timesteps(options.inference_steps, options.scheduler);
+        used_timesteps = sampler.timesteps();
         for (std::size_t step = 0; step < used_timesteps.size(); ++step) {
-            const float timestep = used_timesteps[step];
-            FloatTensor model_input = scheduler.scale_model_input(latents, step);
-            FloatTensor conditional = unet_.forward(model_input,
-                                                    timestep,
-                                                    positive_prompt,
-                                                    positive_pooled,
-                                                    positive_time_ids);
-            FloatTensor prediction;
-            if (options.guidance_scale > 1.0F) {
-                FloatTensor unconditional = unet_.forward(
-                    model_input,
-                    timestep,
-                    conditioning.negative.prompt_embeds,
-                    conditioning.negative.pooled_prompt_embeds,
-                    negative_time_ids);
-                prediction = classifier_free_guidance(
-                    unconditional, conditional, options.guidance_scale);
-                apply_guidance_rescale(prediction, conditional, options.guidance_rescale);
-            } else {
-                prediction = std::move(conditional);
-            }
-            latents = scheduler.step(prediction,
-                                     step,
-                                     latents,
-                                     options.ddim_eta,
-                                     &ddim_generator);
-            if (options.progress) options.progress(step + 1, used_timesteps.size(), timestep, latents);
+            Predictions p = predict(latents, sampler.sigmas()[step], used_timesteps[step], false);
+            latents = sampler.step(p.guided, step, latents, options.ddim_eta, &ddim_generator);
+            if (options.progress) options.progress(step + 1, used_timesteps.size(), used_timesteps[step], latents);
         }
     }
 

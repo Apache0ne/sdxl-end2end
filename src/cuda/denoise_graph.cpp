@@ -1,5 +1,6 @@
 #include "sdxl/cuda/denoise_graph.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <utility>
 
@@ -14,30 +15,32 @@ namespace {
 }
 
 [[nodiscard]] std::vector<float> graph_timesteps(const DenoiseOptions& options) {
-    if (options.scheduler == SchedulerKind::EulerDiscrete) {
-        EulerDiscreteScheduler scheduler(options.scheduler_config);
-        scheduler.set_timesteps(options.inference_steps);
-        return scheduler.timesteps();
-    }
-    if (options.inference_steps == 0 ||
-        options.inference_steps > options.scheduler_config.training_timesteps) {
-        throw CudaError("invalid DDIM graph step count");
-    }
-    const std::size_t ratio =
-        options.scheduler_config.training_timesteps / options.inference_steps;
-    std::vector<float> timesteps(options.inference_steps);
-    for (std::size_t index = 0; index < options.inference_steps; ++index) {
-        timesteps[index] = static_cast<float>(
-            (options.inference_steps - 1 - index) * ratio);
-    }
-    return timesteps;
+    SigmaSchedule schedule(options.scheduler_config);
+    schedule.set_timesteps(options.inference_steps, options.scheduler);
+    return schedule.timesteps();
 }
 
 [[nodiscard]] float graph_initial_noise_scale(const DenoiseOptions& options) {
-    if (options.scheduler != SchedulerKind::EulerDiscrete) return 1.0F;
-    EulerDiscreteScheduler scheduler(options.scheduler_config);
-    scheduler.set_timesteps(options.inference_steps);
-    return scheduler.initial_noise_sigma();
+    if (options.sampler == SamplerKind::DDIM) return 1.0F;
+    SigmaSchedule schedule(options.scheduler_config);
+    schedule.set_timesteps(options.inference_steps, options.scheduler);
+    const float sigma = schedule.initial_noise_sigma();
+    const float model_sigma_max = schedule.training_sigmas().back();
+    const float scale = std::max({1.0F, std::abs(sigma), std::abs(model_sigma_max)});
+    const bool max_denoise = sigma > model_sigma_max ||
+        std::abs(sigma - model_sigma_max) <= 1.0e-5F * scale;
+    if (max_denoise &&
+        options.sampler_config.initial_noise_scaling ==
+            InitialNoiseScaling::ComfyUIMaxDenoise) {
+        // ComfyUI ModelSamplingDiscrete::noise_scaling(..., max_denoise=true).
+        return std::sqrt(1.0F + sigma * sigma);
+    }
+    return sigma;
+}
+
+[[nodiscard]] ScalarType graph_state_type(const DenoiseOptions& options) {
+    return options.sampler_config.state_precision == SamplerStatePrecision::Float32
+        ? ScalarType::Float32 : ScalarType::Float16;
 }
 
 } // namespace
@@ -58,8 +61,22 @@ DenoiseGraph::DenoiseGraph(const Runtime& runtime,
     if (options_.profile_steps) {
         throw CudaError("per-step event profiling cannot be captured into a reusable CUDA Graph");
     }
-    if (options_.scheduler == SchedulerKind::DDIM && options_.ddim_eta != 0.0F) {
-        throw CudaError("reusable DDIM CUDA Graphs currently require eta=0 so seed-dependent noise remains external");
+    if (options_.sampler_config.noise_device == NoiseDevice::CPU) {
+        throw CudaError(
+            "CUDA Graph replay does not support CPU KSampler noise; use --noise-device gpu or disable --cuda-graph");
+    }
+    const bool stochastic_sampler =
+        (options_.sampler == SamplerKind::DDIM && options_.ddim_eta != 0.0F) ||
+        (options_.sampler == SamplerKind::DPMppSDE &&
+         options_.sampler_config.eta > 0.0F && options_.sampler_config.s_noise > 0.0F) ||
+        (options_.sampler == SamplerKind::EulerAncestral &&
+         options_.sampler_config.eta > 0.0F && options_.sampler_config.s_noise > 0.0F) ||
+        (options_.sampler == SamplerKind::DPMpp2SAncestralCFGpp &&
+         options_.sampler_config.eta > 0.0F && options_.sampler_config.s_noise > 0.0F) ||
+        (options_.sampler == SamplerKind::Euler && options_.sampler_config.s_churn > 0.0F);
+    if (stochastic_sampler) {
+        throw CudaError(
+            "reusable CUDA Graphs require a deterministic sampler because stochastic noise must change with each seed");
     }
     if (unet_options.check_finite_output) {
         throw CudaError("finite-check tracing cannot be captured into a reusable CUDA Graph");
@@ -75,13 +92,13 @@ DenoiseGraph::DenoiseGraph(const Runtime& runtime,
     initial_latents_ = Tensor::allocate(
         runtime,
         {conditioning.batch_size, 4, options_.height / 8, options_.width / 8},
-        ScalarType::Float16, TensorRole::Model);
+        graph_state_type(options_), TensorRole::SamplerState);
     Ops ops(runtime);
     ops.random_normal_into(initial_latents_, options_.seed, initial_noise_scale_);
     time_ids_ = denoiser.create_time_ids(
         conditioning.batch_size, options_, conditioning.classifier_free);
     output_latents_ = Tensor::allocate(
-        runtime, initial_latents_.shape(), ScalarType::Float16, TensorRole::Model);
+        runtime, initial_latents_.shape(), graph_state_type(options_), TensorRole::SamplerState);
     runtime.synchronize();
 
     runtime.begin_graph_allocation_capture();

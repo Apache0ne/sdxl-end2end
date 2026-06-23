@@ -2,6 +2,7 @@
 #include "sdxl/cuda/profiler.hpp"
 #include "runtime_internal.hpp"
 #include "fp8_internal.hpp"
+#include "int8_convrot.hpp"
 
 #include <cuda_fp16.h>
 
@@ -56,6 +57,7 @@ public:
     switch (type) {
     case ScalarType::Float8E4M3: return CUDA_R_8F_E4M3;
     case ScalarType::Float8E5M2: return CUDA_R_8F_E5M2;
+    case ScalarType::Int8: return CUDA_R_8I;
     case ScalarType::Float16: return CUDA_R_16F;
     case ScalarType::Float32: return CUDA_R_32F;
     case ScalarType::Int32: break;
@@ -69,6 +71,7 @@ public:
     case ScalarType::Float32: return CUDNN_DATA_FLOAT;
     case ScalarType::Float8E4M3:
     case ScalarType::Float8E5M2:
+    case ScalarType::Int8:
     case ScalarType::Int32: break;
     }
     throw CudaError("cuDNN convolution requires float16 or float32 tensors");
@@ -241,6 +244,21 @@ Tensor Ops::quantize_e5m2(const Tensor& input) const {
 Tensor Ops::linear(const Tensor& input, const Tensor& weight, const Tensor* bias) const {
     if (runtime_ == nullptr) throw CudaError("CUDA Ops has no runtime");
     auto profile = profile_scope(linear_profile_label(input, weight));
+    if (weight.type() == ScalarType::Int8) {
+        if ((input.type() != ScalarType::Float16 && input.type() != ScalarType::Float32) ||
+            input.role() != TensorRole::Model || input.rank() < 2 || weight.rank() != 2) {
+            throw CudaError("INT8 linear requires FP16/FP32 model activations and a rank-2 INT8 weight");
+        }
+        const std::size_t n = weight.size(0);
+        if (bias != nullptr && (bias->type() != input.type() ||
+                                bias->role() != input.role() ||
+                                bias->rank() != 1 || bias->size(0) != n)) {
+            throw CudaError("INT8 linear bias mismatch");
+        }
+        Tensor output = int8_convrot_linear(*runtime_, input, weight);
+        if (bias != nullptr) add_last_dim_bias_in_place(output, *bias);
+        return output;
+    }
     if (is_fp8(weight.type())) {
         if (input.type() != ScalarType::Float16 || input.role() != TensorRole::Model ||
             input.rank() < 2 || weight.rank() != 2) {

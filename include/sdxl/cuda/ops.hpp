@@ -110,6 +110,23 @@ public:
     [[nodiscard]] Tensor euler_scale_repeat_input(const Tensor& sample,
                                                   float sigma,
                                                   std::size_t repeats) const;
+    [[nodiscard]] Tensor predicted_original(const Tensor& model_output,
+                                             const Tensor& sample,
+                                             float sigma,
+                                             int prediction_type) const;
+    [[nodiscard]] Tensor batch_slice(const Tensor& input,
+                                     std::size_t start_batch,
+                                     std::size_t batch_count) const;
+    [[nodiscard]] Tensor combine(const Tensor& a, float ca,
+                                 const Tensor* b = nullptr, float cb = 0.0F,
+                                 const Tensor* c = nullptr, float cc = 0.0F,
+                                 const Tensor* noise = nullptr, float cn = 0.0F) const;
+    [[nodiscard]] Tensor dpmpp_2m_step(const Tensor& denoised,
+                                       const Tensor& sample,
+                                       const Tensor* old_denoised,
+                                       float sigma,
+                                       float sigma_next,
+                                       float sigma_previous = 0.0F) const;
     [[nodiscard]] Tensor euler_step(const Tensor& model_output,
                                     const Tensor& sample,
                                     float sigma,
@@ -141,7 +158,9 @@ public:
 
     [[nodiscard]] Tensor random_normal(std::vector<std::size_t> shape,
                                        std::uint64_t seed,
-                                       float scale = 1.0F) const;
+                                       float scale = 1.0F,
+                                       ScalarType type = ScalarType::Float16,
+                                       TensorRole role = TensorRole::Model) const;
     void random_normal_into(Tensor& output,
                             std::uint64_t seed,
                             float scale = 1.0F) const;

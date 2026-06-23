@@ -61,6 +61,12 @@ The text encoder math executes in float32. FP16/BF16 checkpoint values are
 converted as they are packed into each CPU matrix block. This avoids converting
 all text-encoder weights into a second multi-gigabyte float32 copy.
 
+### Samplers and schedulers
+
+The CPU reference includes DPM++ 2M, Euler, and DDIM. DPM++ 2M with the normal sigma schedule is
+the default. The same eleven schedules and `--sampler` / `--scheduler` names as the CUDA executable
+are supported, allowing deterministic reference checks for every combination.
+
 ## Not implemented yet
 
 - Textual-inversion token injection.
@@ -68,8 +74,6 @@ all text-encoder weights into a second multi-gigabyte float32 copy.
 - Prompt weighting syntax.
 - CUDA text-encoder kernels.
 - UNet forward execution.
-- Scheduler and denoising loop.
-- Classifier-free guidance math in the UNet stage.
 - VAE decoding and image conversion.
 
 ## Build on Windows 11

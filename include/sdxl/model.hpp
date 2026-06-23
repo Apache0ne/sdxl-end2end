@@ -2,6 +2,7 @@
 
 #include "sdxl/safetensors.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -13,11 +14,20 @@
 
 namespace sdxl {
 
+struct QuantizationMetadata {
+    std::optional<TensorView> weight_scale;
+    std::optional<TensorView> input_scale;
+    bool convrot = false;
+    bool per_row = false;
+    std::size_t convrot_group_size = 0;
+};
+
 struct ParameterSlot {
     std::string logical_name;
     std::vector<std::uint64_t> expected_shape;
     bool required = true;
     std::optional<TensorView> tensor;
+    std::optional<QuantizationMetadata> quantization;
 
     [[nodiscard]] bool bound() const noexcept { return tensor.has_value(); }
 };

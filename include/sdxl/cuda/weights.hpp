@@ -30,6 +30,8 @@ struct WeightLoadStats {
     std::size_t device_bytes = 0;
     std::size_t fp8_e4m3_tensors = 0;
     std::size_t fp8_e5m2_tensors = 0;
+    std::size_t int8_tensors = 0;
+    std::size_t int8_convrot_tensors = 0;
     std::size_t fp16_tensors = 0;
     std::size_t fp32_tensors = 0;
     std::size_t tensorwide_scaled_tensors = 0;
@@ -46,6 +48,15 @@ struct FP8WeightLoadOptions {
     FP8Format format = FP8Format::Auto;
     FP8ScaleMode scale_mode = FP8ScaleMode::TensorWide;
     FP8Backend backend = FP8Backend::Auto;
+};
+
+
+struct INT8WeightLoadOptions {
+    bool quantize_floating_weights = true;
+    bool require_prequantized = false;
+    bool strict = false;
+    bool enable_convrot = true;
+    std::size_t convrot_group_size = 256;
 };
 
 struct FP8CacheOptions {
@@ -78,6 +89,9 @@ public:
     [[nodiscard]] WeightLoadStats load_unet_fp8(FP8WeightLoadOptions options = {},
                                                 const FP8CacheOptions* cache = nullptr,
                                                 FP8CacheStats* cache_stats = nullptr);
+    [[nodiscard]] WeightLoadStats load_prefixes_int8(
+        const std::vector<std::string>& prefixes,
+        INT8WeightLoadOptions options = {});
     void unload_prefix(std::string_view prefix);
     void clear();
 
@@ -86,6 +100,9 @@ public:
     [[nodiscard]] std::size_t device_bytes() const noexcept { return device_bytes_; }
     [[nodiscard]] const FP8WeightLoadOptions& active_unet_fp8_options() const noexcept {
         return active_unet_fp8_options_;
+    }
+    [[nodiscard]] const INT8WeightLoadOptions& active_int8_options() const noexcept {
+        return active_int8_options_;
     }
 
 private:
@@ -105,6 +122,7 @@ private:
                          FP8CacheStats& cache_stats) const;
 
     FP8WeightLoadOptions active_unet_fp8_options_{};
+    INT8WeightLoadOptions active_int8_options_{};
 };
 
 } // namespace sdxl::cuda

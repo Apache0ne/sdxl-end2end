@@ -68,3 +68,10 @@ The first post-update generation rebuilds the C3 FP8 cache. Use the second and l
 ## Acceptance rule
 
 Do not force one attention backend globally until the RTX 3060 benchmark records latency and numerical error for each SDXL bucket. `auto` is conservative, but the supplied CSV and traces are the source of truth.
+
+
+## Sampler/scheduler extension
+
+A later runtime extension separates the denoising sampler from sigma scheduling. DPM++ 2M with the
+normal schedule is now the default. Euler and DDIM remain available, and eleven schedules can be
+selected independently through the CLI, warm server, and C++ API. See `SAMPLERS_AND_SCHEDULERS.md`.

@@ -19,7 +19,7 @@ ParameterSlot& ModuleNode::parameter(std::string local_name,
                                      bool required) {
     std::string logical = full_name_.empty() ? std::move(local_name)
                                              : full_name_ + "." + local_name;
-    parameters_.push_back(ParameterSlot{std::move(logical), std::move(expected_shape), required, std::nullopt});
+    parameters_.push_back(ParameterSlot{std::move(logical), std::move(expected_shape), required, std::nullopt, std::nullopt});
     return parameters_.back();
 }
 

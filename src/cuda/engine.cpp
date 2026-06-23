@@ -58,10 +58,32 @@ void fnv_mix_value(std::uint64_t& hash, const T& value) {
 PrecisionProfile parse_precision_profile(std::string value) {
     value = lowercase(std::move(value));
     if (value == "fp8") value = "fp8-auto";
+    if (value == "int8") value = "int8-convrot";
     PrecisionProfile profile;
     profile.canonical = value;
     if (value == "fp16") {
         profile.fp8 = false;
+        return profile;
+    }
+    if (value.rfind("int8", 0) == 0) {
+        profile.fp8 = false;
+        profile.int8 = true;
+        profile.int8_clip = value.find("unet-only") == std::string::npos;
+        profile.int8_weights.enable_convrot = value.find("row") == std::string::npos;
+        profile.int8_weights.strict = value.find("strict") != std::string::npos;
+        profile.int8_weights.require_prequantized =
+            value.find("prequantized") != std::string::npos ||
+            value.find("prequant") != std::string::npos;
+        profile.int8_weights.quantize_floating_weights =
+            !profile.int8_weights.require_prequantized;
+        const bool recognized =
+            value == "int8-convrot" || value == "int8-convrot-strict" ||
+            value == "int8-convrot-prequantized" ||
+            value == "int8-convrot-prequantized-strict" ||
+            value == "int8-row" || value == "int8-row-strict" ||
+            value == "int8-convrot-unet-only" ||
+            value == "int8-convrot-unet-only-strict";
+        if (!recognized) throw CudaError("unknown INT8 precision profile: " + value);
         return profile;
     }
     profile.weights.format = FP8Format::Auto;
@@ -168,6 +190,9 @@ SDXLEngine::SDXLEngine(EngineOptions options) : options_(std::move(options)) {
     int runtime_version = 0;
     cudaRuntimeGetVersion(&runtime_version);
     const int sm = runtime_->device_properties().major * 10 + runtime_->device_properties().minor;
+    if (options_.precision.int8 && sm < 75) {
+        throw CudaError("native W8A8 INT8 requires an NVIDIA Turing-class SM75 or newer GPU");
+    }
     fp8_cache_.path = default_fp8_cache_path(
         options_.model_path, options_.fp8_cache_dir, options_.precision.canonical, sm);
     std::ostringstream key;
@@ -175,8 +200,8 @@ SDXLEngine::SDXLEngine(EngineOptions options) : options_(std::move(options)) {
         << '|' << options_.precision.canonical << "|sm" << sm
         << "|cuda" << runtime_version << "|cudnn" << cudnnGetVersion();
     fp8_cache_.key = key.str();
-    fp8_cache_.read = options_.enable_fp8_cache;
-    fp8_cache_.write = options_.enable_fp8_cache;
+    fp8_cache_.read = options_.enable_fp8_cache && options_.precision.fp8;
+    fp8_cache_.write = options_.enable_fp8_cache && options_.precision.fp8;
     if (options_.preload_components) preload(false, nullptr);
 }
 
@@ -184,6 +209,10 @@ SDXLEngine::~SDXLEngine() = default;
 
 WeightLoadStats SDXLEngine::ensure_clip(ProfileLog* profile) {
     auto scope = profile != nullptr ? profile->scope("stage/clip_weight_upload") : ProfileScope{};
+    if (options_.precision.int8 && options_.precision.int8_clip) {
+        return weights_->load_prefixes_int8(
+            {"text_encoder.", "text_encoder_2."}, options_.precision.int8_weights);
+    }
     return weights_->load_prefixes({"text_encoder.", "text_encoder_2."});
 }
 
@@ -192,6 +221,9 @@ WeightLoadStats SDXLEngine::ensure_unet(ProfileLog* profile, FP8CacheStats* cach
     if (options_.precision.fp8) {
         return weights_->load_unet_fp8(options_.precision.weights,
             options_.enable_fp8_cache ? &fp8_cache_ : nullptr, cache_stats);
+    }
+    if (options_.precision.int8) {
+        return weights_->load_prefixes_int8({"unet."}, options_.precision.int8_weights);
     }
     return weights_->load_prefix("unet.");
 }
@@ -249,10 +281,23 @@ void SDXLEngine::apply_post_decode_policy() {
 std::string SDXLEngine::graph_key(const GenerationRequest& request) const {
     std::ostringstream key;
     key << request.width << 'x' << request.height << '|' << request.steps << '|'
-        << request.prompts.size() << '|' << static_cast<int>(request.scheduler) << '|'
+        << request.prompts.size() << '|' << static_cast<int>(request.sampler) << '|'
+        << static_cast<int>(request.scheduler) << '|'
         << request.guidance << '|' << request.guidance_rescale << '|' << request.ddim_eta << '|'
+        << request.sampler_config.eta << '|' << request.sampler_config.s_noise << '|'
+        << request.sampler_config.r << '|' << request.sampler_config.s_churn << '|'
+        << request.sampler_config.s_tmin << '|' << request.sampler_config.s_tmax << '|'
+        << static_cast<int>(request.sampler_config.noise_device) << '|'
+        << static_cast<int>(request.sampler_config.state_precision) << '|'
+        << static_cast<int>(request.sampler_config.initial_noise_scaling) << '|'
+        << request.scheduler_config.training_timesteps << '|' << request.scheduler_config.beta_start << '|'
+        << request.scheduler_config.beta_end << '|' << request.scheduler_config.karras_rho << '|'
+        << request.scheduler_config.beta_schedule_alpha << '|' << request.scheduler_config.beta_schedule_beta << '|'
+        << request.scheduler_config.linear_quadratic_threshold << '|'
+        << request.scheduler_config.gits_coeff << '|' << request.scheduler_config.denoise << '|'
+        << (request.scheduler_config.set_alpha_to_one ? 1 : 0) << '|'
         << (request.force_cfg ? 1 : 0) << '|'
-        << ((request.force_cfg || request.guidance > 1.0F) ? 1 : 0);
+        << ((request.force_cfg || request.guidance > 1.0F || request.sampler == SamplerKind::DPMpp2SAncestralCFGpp) ? 1 : 0);
     return key.str();
 }
 
@@ -265,6 +310,13 @@ GenerationResult SDXLEngine::generate(const GenerationRequest& request,
     }
     if (!request.seeds.empty() && request.seeds.size() != request.prompts.size()) {
         throw CudaError("seed count must equal prompt count");
+    }
+    const bool stochastic_sampler = request.sampler == SamplerKind::DPMppSDE ||
+        request.sampler == SamplerKind::EulerAncestral ||
+        request.sampler == SamplerKind::DPMpp2SAncestralCFGpp;
+    if (request.cuda_graph && stochastic_sampler && request.sampler_config.eta > 0.0F &&
+        request.sampler_config.s_noise > 0.0F) {
+        throw CudaError("stochastic ancestral/SDE samplers require --eta 0 or --s-noise 0 for CUDA Graph replay");
     }
     if (request.cuda_graph && options_.memory_mode == MemoryMode::Low) {
         throw CudaError("CUDA Graph replay requires balanced or high memory mode so UNet weights remain resident");
@@ -296,7 +348,8 @@ GenerationResult SDXLEngine::generate(const GenerationRequest& request,
     // result, so encoding/running the unconditional branch would double CLIP
     // and UNet work for no numerical benefit. --force-cfg preserves an
     // explicit A/B/debug path.
-    const bool classifier_free = request.force_cfg || request.guidance > 1.0F;
+    const bool classifier_free = request.force_cfg || request.guidance > 1.0F ||
+                                 request.sampler == SamplerKind::DPMpp2SAncestralCFGpp;
     result.cfg_bypassed = !classifier_free;
     profile.add_host(classifier_free ? "config/cfg_enabled" : "config/cfg_bypassed", 0.0);
     TokenizedClassifierFree tokenized;
@@ -333,7 +386,10 @@ GenerationResult SDXLEngine::generate(const GenerationRequest& request,
     denoise.ddim_eta = request.ddim_eta;
     denoise.seed = first_seed(request);
     denoise.batch_seeds = request.seeds;
+    denoise.sampler = request.sampler;
     denoise.scheduler = request.scheduler;
+    denoise.sampler_config = request.sampler_config;
+    denoise.scheduler_config = request.scheduler_config;
     denoise.profile_steps = false;
     UNetOptions unet_options;
     unet_options.check_finite_output = options_.finite_checks;
