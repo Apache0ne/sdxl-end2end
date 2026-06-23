@@ -400,6 +400,15 @@ void Runtime::synchronize() const { SDXL_CUDA_CHECK(cudaStreamSynchronize(state_
 
 MemoryArenaStats Runtime::memory_arena_stats() const noexcept { return state_->arena_stats(); }
 
+INT8ExecutionStats Runtime::int8_execution_stats() const noexcept {
+    return INT8ExecutionStats{
+        state_->int8_linear_calls.load(std::memory_order_relaxed),
+        state_->int8_cublaslt_imma_calls.load(std::memory_order_relaxed),
+        state_->int8_dp4a_fallback_calls.load(std::memory_order_relaxed),
+        state_->int8_tensor_core_plan_misses.load(std::memory_order_relaxed),
+        state_->int8_tensor_core_execution_failures.load(std::memory_order_relaxed)};
+}
+
 void Runtime::trim_memory_arena() const {
     state_->trim_arena();
     SDXL_CUDA_CHECK(cudaStreamSynchronize(state_->stream));

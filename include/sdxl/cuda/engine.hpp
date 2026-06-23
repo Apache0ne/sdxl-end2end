@@ -77,6 +77,8 @@ struct GenerationResult {
     FP8CacheStats fp8_cache;
     MemoryArenaStats arena_before;
     MemoryArenaStats arena_after;
+    INT8ExecutionStats int8_before;
+    INT8ExecutionStats int8_after;
 };
 
 class SDXLEngine final {

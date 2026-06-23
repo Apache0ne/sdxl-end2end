@@ -20,12 +20,13 @@ cuDNN Frontend headers. Set `SDXL_SKIP_CUDNN_FRONTEND=1` to omit that optional b
 
 Persistent storage remains intentionally mixed precision:
 
-- CLIP-L and OpenCLIP-bigG: FP16 weights/activations;
-- eligible UNet rank-2 weights: E4M3 or E5M2 FP8;
+- CLIP-L and OpenCLIP-bigG: FP16, or I8 rank-2 Linear weights with FP16 activations;
+- eligible UNet rank-2 weights: E4M3/E5M2 FP8 or I8 ConvRot/row-wise weights;
 - UNet convolution, normalization, and bias tensors: FP16;
-- UNet activations, residuals, latents, CFG, and scheduler samples: FP16;
+- UNet activations, residuals, latents, CFG, and scheduler model I/O: FP16;
+- sampler state/history: FP32 by default;
 - standard SDXL VAE: FP32 because it is force-upcast;
-- FP8 scales: small FP32 metadata;
+- FP8/INT8 scales: small FP32 metadata;
 - final image: RGB8.
 
 FP32 register/shared-memory accumulation in normalization, attention, scheduler, cuBLASLt, cuDNN,
@@ -101,6 +102,19 @@ one activation tile, and each warp reads adjacent K-major FP8 bytes for its KxN 
 
 Native SM89+ FP8 remains on cuBLASLt and uses ordinary logical row-major storage expected by that
 backend.
+
+## Verified W8A8 INT8 dispatch
+
+The INT8 Linear dispatcher requests multiple cuBLASLt heuristics and validates
+the selected algorithm's numerical implementation flags before recording it as
+an IMMA Tensor Core call. Compatibility profiles may use the in-tree DP4A
+kernel when no verified plan exists. Strict/tensorcore profiles prohibit that
+fallback and return an error containing the exact M/N/K shape. Runtime counters
+make the selected path visible per job.
+
+The DP4A path never expands I8 weights to FP16, but it is not presented as a
+Tensor Core path. A completed strict run is accepted only when INT8 Linear calls
+and verified IMMA calls match and all fallback/miss/failure counters are zero.
 
 ## Persistent execution and allocation
 

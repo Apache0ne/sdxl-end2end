@@ -8,19 +8,22 @@ The native parity changes do not add Python, PyTorch, LibTorch, or a neural CPU 
 
 ## Fresh CPU-reference build
 
-A fresh C++20 CPU-reference build was configured from this exact source snapshot with warnings treated as errors. All six tests passed:
+The host-only regression tests relevant to this repair were compiled directly with C++20 and warnings enabled. The full CUDA CTest suite still requires the target Windows CUDA build. The project test list now includes seven tests:
 
 - `sdxl_tokenizer_test`;
 - `sdxl_text_encoder_test`;
 - `sdxl_unet_scheduler_test`;
 - `sdxl_builtin_tokenizer_test`;
 - `sdxl_scheduler_parity_test`;
-- `sdxl_int8_metadata_test`.
+- `sdxl_int8_metadata_test`;
+- `sdxl_int8_key_layout_test`.
 
-Result:
+Validated in this source environment:
 
 ```text
-100% tests passed, 0 tests failed out of 6
+INT8 checkpoint metadata test passed
+INT8 reference key layout test passed: 196 CLIP-L + 517 OpenCLIP parameters,
+1008 quantized Linear scale tensors
 ```
 
 ## ComfyUI parity regression coverage
@@ -89,29 +92,65 @@ These are implemented and covered by CPU/unit or host checks. Final image qualit
 
 ## Native INT8 ConvRot validation coverage
 
-`tests/int8_metadata_test.cpp` creates a real SafeTensors checkpoint fragment and verifies that the C++ loader preserves I8 weights, per-output-row FP32 scales, regular ConvRot metadata, and the matching zero-copy Q/K/V scale slices for fused OpenCLIP `in_proj_weight`.
+`tests/int8_metadata_test.cpp` creates a real SafeTensors checkpoint fragment
+with deliberately ambiguous CLIP-L/OpenCLIP suffixes. It verifies that the
+nested `conditioner.embedders.1.model.transformer.text_model.*` wrapper binds to
+`text_encoder_2`, preserves I8 weights, binds per-output-row FP32 scales, parses
+ConvRot metadata, and retains matching zero-copy Q/K/V scale slices for fused
+OpenCLIP `in_proj_weight`.
 
-`tests/cuda/cuda_ops_test.cu` covers both native on-the-fly ConvRot quantization and direct prequantized checkpoint execution. The test path rotates weights and activations, performs I8 x I8 accumulation into INT32, applies row scales, and checks the result against a floating identity projection. It also verifies that the prequantized `weight` + `weight_scale` + `comfy_quant` layout produces the same result.
+`tests/int8_key_layout_test.cpp` reads the provided key-only 4,660-tensor
+inventory. It checks exact non-suffix mappings for every required text-encoder
+parameter: 196 CLIP-L parameters and 517 OpenCLIP-bigG parameters. It also
+checks the 1,008 `weight_scale` and 1,008 `comfy_quant` entries.
 
-The production kernel uses cuBLASLt INT8 Tensor Core GEMM when a plan is available and a native CUDA `__dp4a` fallback otherwise. It never expands an INT8 weight matrix to FP16 for inference. A real CUDA 13.x build and RTX 3060 run are still required to validate toolkit ABI, kernel launches, performance, and final image quality.
+`tests/cuda/cuda_ops_test.cu` covers native on-the-fly ConvRot quantization and
+direct prequantized checkpoint execution. The test path rotates weights and
+activations, performs I8 x I8 accumulation into INT32, applies row scales, and
+checks the result against a floating identity projection.
+
+The production dispatcher now accepts a cuBLASLt fast path only when the
+algorithm reports IMMA integer Tensor Core execution with I8 input and I32
+accumulation. It searches up to 32 heuristic candidates. Non-strict profiles
+may use the native CUDA `__dp4a` compatibility kernel and report that fallback.
+Strict/tensorcore profiles make a missing plan or failed execution fatal and
+never run DP4A.
+
+A real CUDA 13.3 build and RTX 3060 run are still required to validate the SDK
+ABI, algorithm availability for every actual M/N/K shape, kernel execution,
+performance, and final image quality.
 
 Recommended RTX 3060 smoke tests:
 
 ```powershell
-# On-the-fly ConvRot of a normal floating SDXL checkpoint
+# On-the-fly ConvRot of the original floating SDXL checkpoint.
 .\build-cuda13\Release\sdxl_cuda_denoise.exe `
-  "D:\models\model.safetensors" 1024 1024 4 1.0 1234 `
-  "a cinematic photograph of a city at night" "blurry" "int8_otf.png" `
+  "D:\StabilityMatrix\Models\StableDiffusion\creapromptLightning_creapromtHypersdxlV1.safetensors" `
+  1024 1024 4 1.0 788897633613589 `
+  "a cinematic photograph of a city at night" "blurry" `
+  "int8_convrot_from_normal.png" `
   --sampler dpmpp_sde --scheduler normal --denoise 1 --comfyui-parity `
-  --memory balanced --precision int8-convrot --int8-strict
+  --memory balanced --precision int8-convrot
 
-# Direct execution of a converted full SDXL ConvRot checkpoint
+# Direct strict execution of the converted full checkpoint.
 .\build-cuda13\Release\sdxl_cuda_denoise.exe `
-  "D:\models\model-int8-convrot.safetensors" 1024 1024 4 1.0 1234 `
-  "a cinematic photograph of a city at night" "blurry" "int8_prequant.png" `
+  "D:\creapromptHyperSDXL_v1.2_FULL_ConvRot_INT8.safetensors" `
+  1024 1024 4 1.0 788897633613589 `
+  "a cinematic photograph of a city at night" "blurry" `
+  "int8_convrot_prequant.png" `
   --sampler dpmpp_sde --scheduler normal --denoise 1 --comfyui-parity `
   --memory balanced --precision int8-convrot-prequantized-strict
 ```
+
+Strict acceptance requires:
+
+```text
+INT8 Linear calls N: verified cuBLASLt IMMA N, DP4A fallback 0,
+IMMA plan misses 0, IMMA execution failures 0
+```
+
+Any different count or any hard error must be treated as an unsupported shape
+or runtime problem, not silently accepted as Tensor Core execution.
 
 ## Required Windows/RTX 3060 acceptance sequence
 
