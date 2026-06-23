@@ -2,6 +2,7 @@
 
 #include "sdxl/cuda/runtime.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -137,6 +138,13 @@ struct RuntimeState final {
     std::size_t persistent_allocations = 0;
     bool graph_allocation_capture_active = false;
     std::unordered_map<MatmulKey, MatmulPlan, MatmulKeyHash> matmul_plans;
+
+    std::atomic<std::size_t> int8_linear_calls{0};
+    std::atomic<std::size_t> int8_cublaslt_imma_calls{0};
+    std::atomic<std::size_t> int8_dp4a_fallback_calls{0};
+    std::atomic<std::size_t> int8_tensor_core_plan_misses{0};
+    std::atomic<std::size_t> int8_tensor_core_execution_failures{0};
+
     std::unordered_map<ConvolutionKey, ConvolutionPlan, ConvolutionKeyHash> convolution_plans;
     std::unordered_map<std::string, std::shared_ptr<void>> sdpa_plans;
 

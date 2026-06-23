@@ -165,6 +165,12 @@ if(SDXL_BUILD_TESTS)
     add_executable(sdxl_int8_metadata_test tests/int8_metadata_test.cpp)
     target_link_libraries(sdxl_int8_metadata_test PRIVATE sdxl_cuda)
     add_test(NAME sdxl_int8_metadata_test COMMAND sdxl_int8_metadata_test)
+
+    add_executable(sdxl_int8_key_layout_test tests/int8_key_layout_test.cpp)
+    target_link_libraries(sdxl_int8_key_layout_test PRIVATE sdxl_cuda)
+    target_compile_definitions(sdxl_int8_key_layout_test PRIVATE
+        SDXL_INT8_KEY_DUMP_PATH="${CMAKE_CURRENT_SOURCE_DIR}/reference/creapromptHyperSDXL_v1.2_FULL_ConvRot_INT8_keys.txt")
+    add_test(NAME sdxl_int8_key_layout_test COMMAND sdxl_int8_key_layout_test)
 endif()
 
 if(SDXL_BUILD_CPU_REFERENCE)

@@ -94,9 +94,22 @@ struct RuntimeOptions {
     // used for large FP16 head-dim-64 buckets. Warp-online and FP32 VAE
     // attention remain correctness fallbacks.
     AttentionBackend attention_backend = AttentionBackend::Auto;
+
+    // When true, every native INT8 Linear must execute through a verified
+    // cuBLASLt IMMA (integer Tensor Core) algorithm. A missing heuristic plan
+    // or a failed matmul becomes a hard error instead of using DP4A.
+    bool int8_require_tensor_cores = false;
 };
 
 struct RuntimeState;
+
+struct INT8ExecutionStats {
+    std::size_t linear_calls = 0;
+    std::size_t cublaslt_imma_calls = 0;
+    std::size_t dp4a_fallback_calls = 0;
+    std::size_t tensor_core_plan_misses = 0;
+    std::size_t tensor_core_execution_failures = 0;
+};
 
 struct MemoryArenaStats {
     std::size_t live_bytes = 0;
@@ -134,6 +147,7 @@ public:
     void synchronize() const;
     void set_seed(std::uint64_t seed) const;
     [[nodiscard]] MemoryArenaStats memory_arena_stats() const noexcept;
+    [[nodiscard]] INT8ExecutionStats int8_execution_stats() const noexcept;
     void trim_memory_arena() const;
 
     // Used by reusable CUDA Graph construction. During capture, temporary

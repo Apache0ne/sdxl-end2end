@@ -402,7 +402,8 @@ __global__ void dequantize_gemm_f16_kernel(const std::int32_t* accumulator,
 }
 
 [[nodiscard]] std::shared_ptr<MatmulDescriptors> create_int8_descriptors(
-    std::size_t m, std::size_t n, std::size_t k, std::size_t workspace_bytes) {
+    std::size_t m, std::size_t n, std::size_t k, std::size_t workspace_bytes,
+    bool require_tensor_cores) {
     auto descriptors = std::make_shared<MatmulDescriptors>();
     SDXL_CUBLAS_CHECK(cublasLtMatmulDescCreate(
         &descriptors->operation, CUBLAS_COMPUTE_32I, CUDA_R_32I));
@@ -433,7 +434,31 @@ __global__ void dequantize_gemm_f16_kernel(const std::int32_t* accumulator,
     SDXL_CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
         descriptors->preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
         &workspace_bytes, sizeof(workspace_bytes)));
+    if (require_tensor_cores) {
+        const std::uint64_t implementation_mask =
+            static_cast<std::uint64_t>(CUBLASLT_NUMERICAL_IMPL_FLAGS_IMMA) |
+            static_cast<std::uint64_t>(CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_32I) |
+            static_cast<std::uint64_t>(CUBLASLT_NUMERICAL_IMPL_FLAGS_INPUT_8I);
+        SDXL_CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
+            descriptors->preference, CUBLASLT_MATMUL_PREF_IMPL_MASK,
+            &implementation_mask, sizeof(implementation_mask)));
+    }
     return descriptors;
+}
+
+[[nodiscard]] bool is_verified_imma_algorithm(
+    const cublasLtMatmulAlgo_t& algorithm) noexcept {
+    std::uint64_t flags = 0;
+    std::size_t written = 0;
+    const cublasStatus_t status = cublasLtMatmulAlgoCapGetAttribute(
+        &algorithm, CUBLASLT_ALGO_CAP_NUMERICAL_IMPL_FLAGS,
+        &flags, sizeof(flags), &written);
+    if (status != CUBLAS_STATUS_SUCCESS || written != sizeof(flags)) return false;
+    const std::uint64_t required =
+        static_cast<std::uint64_t>(CUBLASLT_NUMERICAL_IMPL_FLAGS_IMMA) |
+        static_cast<std::uint64_t>(CUBLASLT_NUMERICAL_IMPL_FLAGS_ACCUMULATOR_32I) |
+        static_cast<std::uint64_t>(CUBLASLT_NUMERICAL_IMPL_FLAGS_INPUT_8I);
+    return (flags & required) == required;
 }
 
 [[nodiscard]] Tensor upload_scale(const Runtime& runtime,
@@ -604,9 +629,12 @@ Tensor int8_convrot_linear(const Runtime& runtime,
 
     Tensor accumulator = Tensor::allocate(
         runtime, {m, n}, ScalarType::Int32, TensorRole::Model);
+    runtime.state()->int8_linear_calls.fetch_add(1, std::memory_order_relaxed);
+
     MatmulPlan plan{};
     const MatmulKey key{m, n, k, 801};
-    bool used_cublas_lt = false;
+    bool used_cublas_lt_imma = false;
+    bool execution_failed = false;
     {
         std::lock_guard lock(runtime.state()->cublas_mutex);
         const auto cached = runtime.state()->matmul_plans.find(key);
@@ -615,25 +643,36 @@ Tensor int8_convrot_linear(const Runtime& runtime,
         } else {
             try {
                 plan.descriptors = create_int8_descriptors(
-                    m, n, k, runtime.options().cublas_workspace_bytes);
-                cublasLtMatmulHeuristicResult_t heuristic{};
+                    m, n, k, runtime.options().cublas_workspace_bytes,
+                    runtime.options().int8_require_tensor_cores);
+
+                constexpr int maximum_heuristics = 32;
+                std::vector<cublasLtMatmulHeuristicResult_t> heuristics(
+                    maximum_heuristics);
                 int returned = 0;
                 const cublasStatus_t heuristic_status = cublasLtMatmulAlgoGetHeuristic(
                     runtime.cublas_lt(), plan.descriptors->operation,
                     plan.descriptors->a, plan.descriptors->b,
                     plan.descriptors->c, plan.descriptors->d,
-                    plan.descriptors->preference, 1, &heuristic, &returned);
-                if (heuristic_status == CUBLAS_STATUS_SUCCESS && returned > 0 &&
-                    heuristic.state == CUBLAS_STATUS_SUCCESS) {
-                    plan.algorithm = heuristic.algo;
-                    plan.workspace_bytes = heuristic.workspaceSize;
-                } else {
-                    plan = {};
+                    plan.descriptors->preference, maximum_heuristics,
+                    heuristics.data(), &returned);
+
+                bool found = false;
+                if (heuristic_status == CUBLAS_STATUS_SUCCESS) {
+                    for (int index = 0; index < returned; ++index) {
+                        const auto& heuristic = heuristics[static_cast<std::size_t>(index)];
+                        if (heuristic.state != CUBLAS_STATUS_SUCCESS ||
+                            !is_verified_imma_algorithm(heuristic.algo)) {
+                            continue;
+                        }
+                        plan.algorithm = heuristic.algo;
+                        plan.workspace_bytes = heuristic.workspaceSize;
+                        found = true;
+                        break;
+                    }
                 }
+                if (!found) plan = {};
             } catch (const CudaError&) {
-                // Some small or unusual SDXL projections have no cuBLASLt
-                // INT8 Tensor Core plan. Keep a cached null plan and use the
-                // native CUDA DP4A fallback without expanding the weights.
                 plan = {};
             }
             runtime.state()->matmul_plans.emplace(key, plan);
@@ -650,13 +689,39 @@ Tensor int8_convrot_linear(const Runtime& runtime,
                 accumulator.data(), plan.descriptors->d,
                 &plan.algorithm, runtime.state()->cublas_workspace,
                 plan.workspace_bytes, runtime.stream());
-            used_cublas_lt = status == CUBLAS_STATUS_SUCCESS;
-            if (!used_cublas_lt) {
+            used_cublas_lt_imma = status == CUBLAS_STATUS_SUCCESS;
+            execution_failed = !used_cublas_lt_imma;
+            if (execution_failed) {
                 runtime.state()->matmul_plans[key] = MatmulPlan{};
             }
         }
     }
-    if (!used_cublas_lt) {
+
+    if (used_cublas_lt_imma) {
+        runtime.state()->int8_cublaslt_imma_calls.fetch_add(
+            1, std::memory_order_relaxed);
+    } else {
+        if (execution_failed) {
+            runtime.state()->int8_tensor_core_execution_failures.fetch_add(
+                1, std::memory_order_relaxed);
+        } else {
+            runtime.state()->int8_tensor_core_plan_misses.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+
+        if (runtime.options().int8_require_tensor_cores) {
+            std::ostringstream message;
+            message << "INT8 Tensor Core-only execution failed for Linear shape M="
+                    << m << ", N=" << n << ", K=" << k << ": "
+                    << (execution_failed
+                        ? "verified cuBLASLt IMMA plan failed at execution"
+                        : "no verified cuBLASLt IMMA heuristic plan was available")
+                    << ". Strict/tensorcore profiles never fall back to DP4A.";
+            throw CudaError(message.str());
+        }
+
+        runtime.state()->int8_dp4a_fallback_calls.fetch_add(
+            1, std::memory_order_relaxed);
         const dim3 threads2d(16, 16);
         const dim3 blocks2d(
             static_cast<unsigned>((n + threads2d.x - 1) / threads2d.x),

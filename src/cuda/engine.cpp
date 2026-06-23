@@ -71,6 +71,8 @@ PrecisionProfile parse_precision_profile(std::string value) {
         profile.int8_clip = value.find("unet-only") == std::string::npos;
         profile.int8_weights.enable_convrot = value.find("row") == std::string::npos;
         profile.int8_weights.strict = value.find("strict") != std::string::npos;
+        profile.int8_weights.require_tensor_cores =
+            profile.int8_weights.strict || value.find("tensorcore") != std::string::npos;
         profile.int8_weights.require_prequantized =
             value.find("prequantized") != std::string::npos ||
             value.find("prequant") != std::string::npos;
@@ -80,6 +82,8 @@ PrecisionProfile parse_precision_profile(std::string value) {
             value == "int8-convrot" || value == "int8-convrot-strict" ||
             value == "int8-convrot-prequantized" ||
             value == "int8-convrot-prequantized-strict" ||
+            value == "int8-convrot-tensorcore" ||
+            value == "int8-convrot-prequantized-tensorcore" ||
             value == "int8-row" || value == "int8-row-strict" ||
             value == "int8-convrot-unet-only" ||
             value == "int8-convrot-unet-only-strict";
@@ -184,6 +188,10 @@ SDXLEngine::SDXLEngine(EngineOptions options) : options_(std::move(options)) {
     runtime_options.non_vae_accumulation = NonVAEAccumulation::Float16;
     runtime_options.fp8_backend = options_.precision.runtime_backend;
     runtime_options.attention_backend = options_.attention_backend;
+    runtime_options.int8_require_tensor_cores =
+        options_.precision.int8 &&
+        (options_.precision.int8_weights.require_tensor_cores ||
+         options_.precision.int8_weights.strict);
     runtime_ = std::make_unique<Runtime>(runtime_options);
     weights_ = std::make_unique<WeightStore>(*runtime_, model_);
 
@@ -335,6 +343,7 @@ GenerationResult SDXLEngine::generate(const GenerationRequest& request,
     profile.add_host("stage/checkpoint_map", checkpoint_map_ms_);
     GenerationResult result;
     result.arena_before = runtime_->memory_arena_stats();
+    result.int8_before = runtime_->int8_execution_stats();
 
     TextEncoderOptions text_options;
     text_options.check_finite_outputs = options_.finite_checks;
@@ -446,6 +455,7 @@ GenerationResult SDXLEngine::generate(const GenerationRequest& request,
     if (profile_output != nullptr) profile.print(*profile_output);
     result.profile_records = profile.records();
     result.arena_after = runtime_->memory_arena_stats();
+    result.int8_after = runtime_->int8_execution_stats();
     return result;
 }
 

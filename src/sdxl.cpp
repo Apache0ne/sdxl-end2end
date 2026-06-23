@@ -680,8 +680,16 @@ struct DerivedLookup {
                     if (const json::Value* value = parsed.find("per_row")) {
                         metadata.per_row = value->as_bool();
                     }
-                    if (const json::Value* value = parsed.find("convrot_groupsize")) {
-                        metadata.convrot_group_size = static_cast<std::size_t>(value->as_u64());
+                    if (const json::Value* legacy_group_size = parsed.find("convrot_groupsize")) {
+                        metadata.convrot_group_size =
+                            static_cast<std::size_t>(legacy_group_size->as_u64());
+                    } else if (const json::Value* explicit_group_size =
+                                   parsed.find("convrot_group_size")) {
+                        metadata.convrot_group_size =
+                            static_cast<std::size_t>(explicit_group_size->as_u64());
+                    } else if (const json::Value* generic_group_size = parsed.find("group_size")) {
+                        metadata.convrot_group_size =
+                            static_cast<std::size_t>(generic_group_size->as_u64());
                     }
                 }
             } catch (const std::exception&) {
@@ -731,13 +739,23 @@ struct DerivedLookup {
         }
     } else if (starts_with(slot.logical_name, "text_encoder.")) {
         const std::string key = strip_prefix(slot.logical_name, "text_encoder.");
-        for (const auto& prefix : {"conditioner.embedders.0.transformer.", "conditioner.embedders.0.model."}) {
+        // Support both the normal SDXL CLIP-L wrapper and converters that keep
+        // an additional Hugging Face model/transformer nesting level.
+        for (const auto& prefix : {
+                 "conditioner.embedders.0.transformer.",
+                 "conditioner.embedders.0.model.transformer.",
+                 "conditioner.embedders.0.model."}) {
             if (const TensorView* view = store.find(std::string(prefix) + key)) return *view;
         }
     } else if (starts_with(slot.logical_name, "text_encoder_2.")) {
         const std::string key = strip_prefix(slot.logical_name, "text_encoder_2.");
-        // Some converted single files already store Hugging Face CLIP keys under a component prefix.
-        for (const auto& prefix : {"conditioner.embedders.1.model.", "conditioner.embedders.1.transformer."}) {
+        // Full converted SDXL checkpoints commonly preserve the OpenCLIP
+        // wrapper as conditioner.embedders.1.model.transformer.text_model...
+        // before storing separate Hugging Face q/k/v projections.
+        for (const auto& prefix : {
+                 "conditioner.embedders.1.model.transformer.",
+                 "conditioner.embedders.1.model.",
+                 "conditioner.embedders.1.transformer."}) {
             if (const TensorView* view = store.find(std::string(prefix) + key)) return *view;
         }
         for (const auto& lookup : text_encoder_2_original_candidates(slot.logical_name)) {

@@ -46,6 +46,10 @@ The standard SDXL tokenizers are embedded in the executable. A normal run needs 
 
 There is no neural-network CPU fallback in the normal target.
 
+The original-single-file loader accepts the converted dual-encoder wrapper
+`conditioner.embedders.1.model.transformer.text_model.*`; this avoids ambiguous
+suffix binding between the first 12 CLIP-L and OpenCLIP-bigG layers.
+
 ## Production runtime additions
 
 - asynchronous CUDA-event profiler with nested per-block/per-op timings
@@ -104,19 +108,32 @@ On SM89 and newer, aligned projections can use native cuBLASLt FP8 Tensor Cores.
 ```text
 int8-convrot
 int8-convrot-strict
+int8-convrot-tensorcore
 int8-convrot-prequantized
 int8-convrot-prequantized-strict
+int8-convrot-prequantized-tensorcore
 int8-row
 int8-row-strict
 int8-convrot-unet-only
+int8-convrot-unet-only-strict
 ```
 
-On RTX 20/30-series GPUs, eligible UNet and CLIP Linear layers use dynamic
-per-row activation quantization, per-output-row weight scales, INT32
+Eligible UNet and CLIP Linear layers use dynamic per-row activation
+quantization, per-output-row weight scales, I8 x I8 multiplication, INT32
 accumulation, and a CUDA dequantization epilogue. ConvRot uses the regular H4
 Kronecker transform with group size 256 by default. Floating checkpoints can be
 quantized when uploaded, or prequantized I8 checkpoints can be loaded directly.
-See [INT8_CONVROT.md](INT8_CONVROT.md).
+
+The runtime verifies cuBLASLt numerical implementation flags before counting a
+call as integer Tensor Core/IMMA. Non-strict profiles prefer verified IMMA but
+may report a native DP4A compatibility fallback. `*-strict`, `*-tensorcore`, and
+`--int8-tensor-cores-only` prohibit DP4A and fail on any unsupported or failed
+shape. The final log prints exact IMMA/fallback/miss/failure counters.
+
+Converted full checkpoints using
+`conditioner.embedders.1.model.transformer.text_model.*` are supported directly.
+See [INT8_CONVROT.md](INT8_CONVROT.md) and
+[INT8_RUNTIME_FIXES.md](INT8_RUNTIME_FIXES.md).
 
 
 ## Samplers and schedulers
@@ -477,6 +494,7 @@ SAMPLER_SCHEDULER_MATRIX.bat D:\models\myModelXL.safetensors 512 4
 --precision PROFILE
 --int8-group-size 4|16|64|256
 --int8-strict
+--int8-tensor-cores-only
 --int8-prequantized-only
 --int8-unet-only
 --attention auto|cudnn-sdpa|flash-sm80|warp-online
@@ -518,7 +536,7 @@ SAMPLER_SCHEDULER_MATRIX.bat D:\models\myModelXL.safetensors 512 4
 | `src/cuda/profiler.cpp` | asynchronous CUDA event profiler and trace export |
 | `src/cuda/runtime.cpp` | CUDA handles, plan caches, persistent GPU arena |
 | `src/cuda/weights.cu` | floating, FP8, and native INT8 component loading |
-| `src/cuda/int8_convrot.cu` | ConvRot, row-wise W8A8 quantization, cuBLASLt INT8 GEMM, and DP4A fallback |
+| `src/cuda/int8_convrot.cu` | ConvRot/row-wise W8A8, verified cuBLASLt IMMA selection, strict enforcement, counters, and non-strict DP4A compatibility fallback |
 | `src/cuda/ops_blas.cpp` | persistent cuBLASLt/cuDNN plans |
 | `src/cuda/ops_kernels.cu` | attention dispatch, fused normalization, CFG, scheduler, and RNG kernels |
 | `src/cuda/flash_attention_sm80.cu` | raw FP16 Tensor Core FlashAttention-style forward kernel |

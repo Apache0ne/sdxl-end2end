@@ -91,8 +91,13 @@ int main() {
         constexpr std::size_t time_columns = 320;
         constexpr std::size_t qkv_rows = 3840;
         constexpr std::size_t qkv_columns = 1280;
+        constexpr std::size_t clip_l_width = 768;
+        constexpr std::size_t openclip_width = 1280;
+        constexpr std::size_t clip_positions = 77;
         const std::string config =
             R"({"convrot":true,"convrot_groupsize":256,"per_row":true})";
+        const std::string alternate_config =
+            R"({"convrot":true,"convrot_group_size":256,"per_row":true})";
 
         write_safetensors(path, {
             {"model.diffusion_model.time_embed.0.weight", "I8",
@@ -107,6 +112,33 @@ int main() {
              {qkv_rows, 1}, float_bytes(qkv_rows, 0.02F)},
             {"conditioner.embedders.1.model.transformer.resblocks.0.attn.in_proj_comfy_quant", "U8",
              {config.size()}, string_bytes(config)},
+
+            // Converted full checkpoints may keep Hugging Face text_model keys
+            // under conditioner.embedders.1.model.transformer. Include the
+            // same suffix under CLIP-L so suffix-only lookup is ambiguous and
+            // the explicit nested OpenCLIP prefix is required.
+            {"conditioner.embedders.0.transformer.text_model.embeddings.position_embedding.weight", "F16",
+             {clip_positions, clip_l_width},
+             repeated_bytes(clip_positions * clip_l_width * sizeof(std::uint16_t), 0)},
+            {"conditioner.embedders.1.model.transformer.text_model.embeddings.position_embedding.weight", "F16",
+             {clip_positions, openclip_width},
+             repeated_bytes(clip_positions * openclip_width * sizeof(std::uint16_t), 0)},
+
+            {"conditioner.embedders.0.transformer.text_model.encoder.layers.1.self_attn.q_proj.weight", "I8",
+             {clip_l_width, clip_l_width},
+             repeated_bytes(clip_l_width * clip_l_width, 3)},
+            {"conditioner.embedders.0.transformer.text_model.encoder.layers.1.self_attn.q_proj.weight_scale", "F32",
+             {clip_l_width}, float_bytes(clip_l_width, 0.03F)},
+            {"conditioner.embedders.0.transformer.text_model.encoder.layers.1.self_attn.q_proj.comfy_quant", "U8",
+             {config.size()}, string_bytes(config)},
+
+            {"conditioner.embedders.1.model.transformer.text_model.encoder.layers.1.self_attn.q_proj.weight", "I8",
+             {openclip_width, openclip_width},
+             repeated_bytes(openclip_width * openclip_width, 4)},
+            {"conditioner.embedders.1.model.transformer.text_model.encoder.layers.1.self_attn.q_proj.weight_scale", "F32",
+             {openclip_width}, float_bytes(openclip_width, 0.04F)},
+            {"conditioner.embedders.1.model.transformer.text_model.encoder.layers.1.self_attn.q_proj.comfy_quant", "U8",
+             {alternate_config.size()}, string_bytes(alternate_config)},
         });
 
         sdxl::SDXLModel model;
@@ -143,6 +175,28 @@ int main() {
                     slot->quantization->convrot_group_size == 256,
                     "OpenCLIP QKV ConvRot metadata mismatch");
         }
+
+        const sdxl::ParameterSlot* nested_position = model.graph().find_parameter(
+            "text_encoder_2.text_model.embeddings.position_embedding.weight");
+        require(nested_position != nullptr && nested_position->tensor.has_value(),
+                "nested Hugging Face OpenCLIP position embedding was not bound");
+        require(nested_position->tensor->source_key ==
+                    "conditioner.embedders.1.model.transformer.text_model.embeddings.position_embedding.weight",
+                "nested OpenCLIP position embedding bound to the wrong encoder");
+
+        const sdxl::ParameterSlot* nested_q = model.graph().find_parameter(
+            "text_encoder_2.text_model.encoder.layers.1.self_attn.q_proj.weight");
+        require(nested_q != nullptr && nested_q->tensor.has_value(),
+                "nested Hugging Face OpenCLIP q_proj was not bound");
+        require(nested_q->tensor->source_key ==
+                    "conditioner.embedders.1.model.transformer.text_model.encoder.layers.1.self_attn.q_proj.weight",
+                "nested OpenCLIP q_proj bound to the wrong encoder");
+        require(nested_q->tensor->dtype == sdxl::DType::I8,
+                "nested OpenCLIP q_proj INT8 dtype was not preserved");
+        require(nested_q->quantization.has_value() &&
+                    nested_q->quantization->weight_scale.has_value() &&
+                    nested_q->quantization->weight_scale->element_count() == openclip_width,
+                "nested OpenCLIP q_proj quantization metadata was not bound");
 
         std::filesystem::remove(path);
         std::cout << "INT8 checkpoint metadata test passed\n";

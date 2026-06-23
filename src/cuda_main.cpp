@@ -50,6 +50,7 @@ struct Options {
     std::size_t arena_cache_mib = static_cast<std::size_t>(-1);
     std::size_t int8_group_size = 256;
     bool int8_strict = false;
+    bool int8_tensor_cores_only = false;
     bool int8_prequantized_only = false;
     bool int8_unet_only = false;
     float guidance_rescale = 0.0F;
@@ -112,6 +113,7 @@ struct Options {
         else if (argument == "--arena-cache-mib") options.arena_cache_mib = std::stoull(value_after(index, argc, argv, argument));
         else if (argument == "--int8-group-size") options.int8_group_size = std::stoull(value_after(index, argc, argv, argument));
         else if (argument == "--int8-strict") options.int8_strict = true;
+        else if (argument == "--int8-tensor-cores-only") options.int8_tensor_cores_only = true;
         else if (argument == "--int8-prequantized-only") options.int8_prequantized_only = true;
         else if (argument == "--int8-unet-only") options.int8_unet_only = true;
         else if (argument == "--guidance-rescale") options.guidance_rescale = std::stof(value_after(index, argc, argv, argument));
@@ -163,7 +165,8 @@ void usage() {
            "  --memory low|balanced|high   balanced keeps FP8 UNet resident\n"
            "  --precision <profile>        fp16, FP8 profiles, int8-convrot, or int8-row\n"
            "  --int8-group-size N          ConvRot group size: 4, 16, 64, or 256\n"
-           "  --int8-strict                never fall back to floating-point linear weights\n"
+           "  --int8-strict                reject upload fallback and require verified IMMA\n"
+           "  --int8-tensor-cores-only     hard-error instead of using the DP4A fallback\n"
            "  --int8-prequantized-only     require I8 weights plus weight_scale metadata\n"
            "  --int8-unet-only             keep both SDXL text encoders in FP16\n"
            "  --attention <backend>         auto, cudnn-sdpa, flash-sm80, or warp-online\n"
@@ -284,7 +287,7 @@ void append_benchmark(const std::filesystem::path& path,
     std::ofstream output(path, std::ios::app);
     if (!output) throw std::runtime_error("cannot open benchmark CSV");
     if (!exists) {
-        output << "width,height,steps,batch,sampler,scheduler,precision,memory,attention,cfg_bypassed,wall_ms,map_ms,clip_upload_ms,clip_encode_ms,unet_upload_ms,denoise_ms,attention_ms,cudnn_attention_ms,flash_attention_ms,warp_attention_ms,linear_ms,convolution_ms,vae_upload_ms,vae_decode_ms,rgb_download_ms,image_write_ms,graph_replay,fp8_cache_hit,temp_driver_alloc_delta,arena_hit_delta,slab_suballocation_delta,persistent_alloc_delta,persistent_live_bytes\n";
+        output << "width,height,steps,batch,sampler,scheduler,precision,memory,attention,cfg_bypassed,wall_ms,map_ms,clip_upload_ms,clip_encode_ms,unet_upload_ms,denoise_ms,attention_ms,cudnn_attention_ms,flash_attention_ms,warp_attention_ms,linear_ms,convolution_ms,vae_upload_ms,vae_decode_ms,rgb_download_ms,image_write_ms,graph_replay,fp8_cache_hit,temp_driver_alloc_delta,arena_hit_delta,slab_suballocation_delta,persistent_alloc_delta,persistent_live_bytes,int8_linear_calls,int8_imma_calls,int8_dp4a_fallbacks,int8_imma_plan_misses,int8_imma_execution_failures\n";
     }
     const auto delta = [](std::size_t after, std::size_t before) {
         return after >= before ? after - before : 0U;
@@ -303,6 +306,7 @@ void append_benchmark(const std::filesystem::path& path,
            << profile_sum(result, "stage/complete_denoise_loop") +
               profile_sum(result, "stage/cuda_graph_denoise_replay") << ','
            << profile_sum_prefix(result, "ops/attention/") << ','
+           << profile_sum_prefix(result, "ops/attention/cudnn-sdpa/") << ','
            << profile_sum_prefix(result, "ops/attention/flash-sm80/") << ','
            << profile_sum_prefix(result, "ops/attention/warp-online/") << ','
            << profile_sum_prefix(result, "ops/linear/") << ','
@@ -316,7 +320,16 @@ void append_benchmark(const std::filesystem::path& path,
            << delta(result.arena_after.cache_hits, result.arena_before.cache_hits) << ','
            << delta(result.arena_after.slab_suballocations, result.arena_before.slab_suballocations) << ','
            << delta(result.arena_after.persistent_allocations, result.arena_before.persistent_allocations) << ','
-           << result.arena_after.persistent_live_bytes
+           << result.arena_after.persistent_live_bytes << ','
+           << delta(result.int8_after.linear_calls, result.int8_before.linear_calls) << ','
+           << delta(result.int8_after.cublaslt_imma_calls,
+                    result.int8_before.cublaslt_imma_calls) << ','
+           << delta(result.int8_after.dp4a_fallback_calls,
+                    result.int8_before.dp4a_fallback_calls) << ','
+           << delta(result.int8_after.tensor_core_plan_misses,
+                    result.int8_before.tensor_core_plan_misses) << ','
+           << delta(result.int8_after.tensor_core_execution_failures,
+                    result.int8_before.tensor_core_execution_failures)
            << '\n';
 }
 
@@ -416,14 +429,21 @@ int main(int argc, char** argv) {
         engine_options.precision = sdxl::cuda::parse_precision_profile(options.precision);
         if (engine_options.precision.int8) {
             engine_options.precision.int8_weights.convrot_group_size = options.int8_group_size;
-            if (options.int8_strict) engine_options.precision.int8_weights.strict = true;
+            if (options.int8_strict) {
+                engine_options.precision.int8_weights.strict = true;
+                engine_options.precision.int8_weights.require_tensor_cores = true;
+            }
+            if (options.int8_tensor_cores_only) {
+                engine_options.precision.int8_weights.require_tensor_cores = true;
+            }
             if (options.int8_prequantized_only) {
                 engine_options.precision.int8_weights.require_prequantized = true;
                 engine_options.precision.int8_weights.quantize_floating_weights = false;
             }
             if (options.int8_unet_only) engine_options.precision.int8_clip = false;
-        } else if (options.int8_strict || options.int8_prequantized_only ||
-                   options.int8_unet_only || options.int8_group_size != 256U) {
+        } else if (options.int8_strict || options.int8_tensor_cores_only ||
+                   options.int8_prequantized_only || options.int8_unet_only ||
+                   options.int8_group_size != 256U) {
             throw std::runtime_error("INT8 tuning flags require --precision int8-convrot or int8-row");
         }
         engine_options.attention_backend = sdxl::cuda::parse_attention_backend(options.attention);
@@ -455,8 +475,14 @@ int main(int argc, char** argv) {
                   << ", sampler-state: " << sdxl::sampler_state_precision_name(
                          sdxl::parse_sampler_state_precision(options.sampler_state))
                   << ", initial-noise: " << sdxl::initial_noise_scaling_name(
-                         sdxl::parse_initial_noise_scaling(options.initial_noise_scaling))
-                  << ".\n";
+                         sdxl::parse_initial_noise_scaling(options.initial_noise_scaling));
+        if (engine_options.precision.int8) {
+            std::cout << ", int8-kernels: "
+                      << (engine_options.precision.int8_weights.require_tensor_cores
+                              ? "verified-cuBLASLt-IMMA-only"
+                              : "verified-cuBLASLt-IMMA-preferred; DP4A allowed");
+        }
+        std::cout << ".\n";
         if (engine_options.precision.fp8 && options.fp8_cache) {
             std::cout << "FP8 cache: " << engine.fp8_cache_options().path.string() << '\n';
         }
@@ -512,6 +538,7 @@ int main(int argc, char** argv) {
                       << ": batch " << request.prompts.size() << ", seed "
                       << request.seeds.front() << ", prompt: " << job.prompt << '\n';
             const auto job_arena_before = engine.runtime().memory_arena_stats();
+            const auto int8_before = engine.runtime().int8_execution_stats();
             const auto begin = std::chrono::steady_clock::now();
             sdxl::cuda::GenerationResult generated = engine.generate(
                 request, options.profile ? &std::cout : nullptr);
@@ -545,6 +572,7 @@ int main(int argc, char** argv) {
                 request, std::move(generated), wall_ms, std::move(written_paths)});
             if (options.trim_between_jobs) engine.trim_temporary_memory();
             const auto stats = engine.runtime().memory_arena_stats();
+            const auto int8_after = engine.runtime().int8_execution_stats();
             const auto delta = [](std::size_t after, std::size_t before) {
                 return after >= before ? after - before : 0U;
             };
@@ -558,7 +586,24 @@ int main(int argc, char** argv) {
                       << delta(stats.slab_suballocations, job_arena_before.slab_suballocations)
                       << "; persistent weight allocations "
                       << delta(stats.persistent_allocations, job_arena_before.persistent_allocations)
-                      << " (" << stats.persistent_live_bytes << " bytes resident).\n";
+                      << " (" << stats.persistent_live_bytes << " bytes resident)";
+            if (engine_options.precision.int8) {
+                std::cout << "; INT8 Linear calls "
+                          << delta(int8_after.linear_calls, int8_before.linear_calls)
+                          << ": verified cuBLASLt IMMA "
+                          << delta(int8_after.cublaslt_imma_calls,
+                                   int8_before.cublaslt_imma_calls)
+                          << ", DP4A fallback "
+                          << delta(int8_after.dp4a_fallback_calls,
+                                   int8_before.dp4a_fallback_calls)
+                          << ", IMMA plan misses "
+                          << delta(int8_after.tensor_core_plan_misses,
+                                   int8_before.tensor_core_plan_misses)
+                          << ", IMMA execution failures "
+                          << delta(int8_after.tensor_core_execution_failures,
+                                   int8_before.tensor_core_execution_failures);
+            }
+            std::cout << ".\n";
         }
         writer.flush();
         const auto write_records = writer.take_records();

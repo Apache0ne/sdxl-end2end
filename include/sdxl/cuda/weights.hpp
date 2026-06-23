@@ -54,7 +54,13 @@ struct FP8WeightLoadOptions {
 struct INT8WeightLoadOptions {
     bool quantize_floating_weights = true;
     bool require_prequantized = false;
+
+    // Strict mode rejects floating linear fallback during upload. It also
+    // enables require_tensor_cores so an INT8 Linear can never silently run
+    // through the scalar/DP4A compatibility kernel.
     bool strict = false;
+    bool require_tensor_cores = false;
+
     bool enable_convrot = true;
     std::size_t convrot_group_size = 256;
 };
