@@ -1,7 +1,7 @@
 ### Only human input is here : How a (hummus)human runs this project using powershell:
 
 <p align="center">
-  <img src="assets/output.png" alt="Output Image" width="500">
+  <img src="assets/outputnew.png" alt="Output Image" width="500">
 </p>
 
 IF you never ran this project before: 1st Agent prompt: ```Audit this project: "Path to the project folder on users system". make a compact list of installs I need to run the project and check what I already have and do not have installed with web links to the needed installs I dont have. ```
