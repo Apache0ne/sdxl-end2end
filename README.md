@@ -1,8 +1,33 @@
 ### Only human input is here : How a (hummus)human runs this project using powershell:
 
-<p align="center">
-  <img src="assets/outputnew.png" alt="Output Image" width="500">
-</p>
+<table>
+  <tr>
+    <td align="center">
+      <img src="assets/preview_1.png" alt="Preview 1 - 1024x1024" width="260"><br>
+      <sub>Preview 1 - 1024x1024</sub>
+    </td>
+    <td align="center">
+      <img src="assets/preview_2.png" alt="Preview 2 - 1152x896" width="300"><br>
+      <sub>Preview 2 - 1152x896</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="assets/preview_3.png" alt="Preview 3 - 1216x832" width="310"><br>
+      <sub>Preview 3 - 1216x832</sub>
+    </td>
+    <td align="center">
+      <img src="assets/preview_4.png" alt="Preview 4 - 1344x768" width="330"><br>
+      <sub>Preview 4 - 1344x768</sub>
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <img src="assets/preview_5.png" alt="Preview 5 - 1536x640" width="520"><br>
+      <sub>Preview 5 - 1536x640</sub>
+    </td>
+  </tr>
+</table>
 
 IF you never ran this project before: 1st Agent prompt: ```Audit this project: "Path to the project folder on users system". make a compact list of installs I need to run the project and check what I already have and do not have installed with web links to the needed installs I dont have. ```
 
