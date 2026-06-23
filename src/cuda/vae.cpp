@@ -114,8 +114,9 @@ Tensor VAE::decode(const Tensor& latents) const {
         throw CudaError("CUDA VAE weights are not resident; load prefix vae. first");
     }
 
-    // SDXL's base VAE is configured with force_upcast=true. Keep the denoising
-    // latents in FP16, then upcast once before every VAE convolution/attention op.
+    // SDXL's base VAE is configured with force_upcast=true. Sampler state may
+    // be FP16 or FP32; normalize it once into the FP32 VAE tensor role before
+    // every decoder convolution/attention operation.
     Tensor hidden = ops_.cast_scale(
         latents, ScalarType::Float32, TensorRole::VAE,
         1.0F / options_.scaling_factor);

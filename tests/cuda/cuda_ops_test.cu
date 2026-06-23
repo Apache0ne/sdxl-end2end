@@ -6,6 +6,7 @@
 #include "sdxl/cuda/vae.hpp"
 #include "sdxl/cuda/weights.hpp"
 #include "sdxl/sdxl.hpp"
+#include "int8_convrot.hpp"
 
 #include <algorithm>
 #include <array>
@@ -124,6 +125,58 @@ int main() {
         if (!rejected_non_vae_fp32) {
             throw std::runtime_error("strict non-VAE FP32 allocation guard did not fire");
         }
+        auto sampler_state = sdxl::cuda::Tensor::from_host_f32(
+            runtime, sdxl::FloatTensor{{1, 2}, {2.0F, -1.0F}},
+            sdxl::cuda::ScalarType::Float32,
+            sdxl::cuda::TensorRole::SamplerState);
+        if (sampler_state.type() != sdxl::cuda::ScalarType::Float32 ||
+            sampler_state.role() != sdxl::cuda::TensorRole::SamplerState) {
+            throw std::runtime_error("FP32 sampler-state allocation failed");
+        }
+        const auto scaled_sampler_state_device = ops.euler_scale_input(
+            sampler_state, 1.0F);
+        if (scaled_sampler_state_device.type() != sdxl::cuda::ScalarType::Float16 ||
+            scaled_sampler_state_device.role() != sdxl::cuda::TensorRole::Model) {
+            throw std::runtime_error("FP32 sampler input was not converted to an FP16 model tensor");
+        }
+        const auto scaled_sampler_state = scaled_sampler_state_device.to_host_f32(runtime);
+        require_close(scaled_sampler_state.values[0], std::sqrt(2.0F), 0.002F,
+                      "FP32 sampler input scaling");
+        require_close(scaled_sampler_state.values[1], -1.0F / std::sqrt(2.0F), 0.002F,
+                      "FP32 sampler input scaling");
+
+        // Regression: ComfyUI parity keeps the solver state in FP32, then the
+        // VAE decoder explicitly reclassifies that same storage type as VAE
+        // input. Same-dtype Ops::cast must copy the payload across roles rather
+        // than calling Tensor::copy_from(), whose stricter contract rejects role
+        // mismatches by design.
+        const auto vae_latents = ops.cast(
+            sampler_state, sdxl::cuda::ScalarType::Float32,
+            sdxl::cuda::TensorRole::VAE);
+        if (vae_latents.type() != sdxl::cuda::ScalarType::Float32 ||
+            vae_latents.role() != sdxl::cuda::TensorRole::VAE) {
+            throw std::runtime_error("FP32 sampler-state to VAE role cast failed");
+        }
+        const auto vae_latents_host = vae_latents.to_host_f32(runtime);
+        require_close(vae_latents_host.values[0], 2.0F, 0.0F,
+                      "same-dtype sampler-state to VAE cast");
+        require_close(vae_latents_host.values[1], -1.0F, 0.0F,
+                      "same-dtype sampler-state to VAE cast");
+        auto sampler_prediction = upload(runtime, {1, 2}, {0.5F, -0.25F});
+        const auto sampler_x0 = ops.predicted_original(
+            sampler_prediction, sampler_state, 1.0F, 0).to_host_f32(runtime);
+        require_close(sampler_x0.values[0], 1.5F, 0.001F, "FP32 predicted x0");
+        require_close(sampler_x0.values[1], -0.75F, 0.001F, "FP32 predicted x0");
+        auto sampler_noise = sdxl::cuda::Tensor::allocate(
+            runtime, {1, 2}, sdxl::cuda::ScalarType::Float32,
+            sdxl::cuda::TensorRole::SamplerState);
+        ops.random_normal_into(sampler_noise, 1234);
+        const auto sampler_noise_host = sampler_noise.to_host_f32(runtime);
+        for (const float value : sampler_noise_host.values) {
+            if (!std::isfinite(value)) {
+                throw std::runtime_error("FP32 sampler noise is not finite");
+            }
+        }
 
         // Basic custom elementwise kernel.
         auto first_device = upload(runtime, {1, 4}, {1.0F, 2.0F, 3.0F, 4.0F});
@@ -211,6 +264,87 @@ int main() {
         for (std::size_t index = 0; index < aligned_output.values.size(); ++index) {
             require_close(aligned_output.values[index], aligned_input_values[index],
                           0.08F, "aligned FP8 linear");
+        }
+
+        // Native W8A8 ConvRot: the weight is rotated once at load time,
+        // activations are rotated and quantized per row, INT8 accumulates into
+        // INT32, and the epilogue applies activation and per-output-row scales.
+        std::vector<float> int8_identity_values{
+            1.0F, 0.0F, 0.0F, 0.0F,
+            0.0F, 1.0F, 0.0F, 0.0F,
+            0.0F, 0.0F, 1.0F, 0.0F,
+            0.0F, 0.0F, 0.0F, 1.0F};
+        sdxl::TensorView int8_identity_view;
+        int8_identity_view.data = reinterpret_cast<const std::byte*>(int8_identity_values.data());
+        int8_identity_view.dtype = sdxl::DType::F32;
+        int8_identity_view.shape = {4, 4};
+        int8_identity_view.strides_bytes = {4 * static_cast<std::int64_t>(sizeof(float)),
+                                            static_cast<std::int64_t>(sizeof(float))};
+        int8_identity_view.storage_bytes = int8_identity_values.size() * sizeof(float);
+        int8_identity_view.source_key = "test.identity.weight";
+        sdxl::cuda::INT8WeightLoadOptions int8_options;
+        int8_options.enable_convrot = true;
+        int8_options.convrot_group_size = 4;
+        int8_options.strict = true;
+        auto int8_convrot_weight = sdxl::cuda::upload_or_quantize_int8_weight(
+            runtime, int8_identity_view, nullptr, sdxl::cuda::TensorRole::Model,
+            int8_options);
+        if (int8_convrot_weight.type() != sdxl::cuda::ScalarType::Int8 ||
+            int8_convrot_weight.convrot_group_size() != 4 ||
+            int8_convrot_weight.dequant_scale_count() != 4) {
+            throw std::runtime_error("native INT8 ConvRot weight metadata mismatch");
+        }
+        auto int8_input = upload(runtime, {2, 4}, {
+            0.25F, -0.5F, 0.75F, 1.0F,
+            -1.0F, 0.5F, 0.0F, 0.25F});
+        auto int8_output = ops.linear(int8_input, int8_convrot_weight, nullptr).to_host_f32(runtime);
+        const float int8_expected[] = {
+            0.25F, -0.5F, 0.75F, 1.0F,
+            -1.0F, 0.5F, 0.0F, 0.25F};
+        for (std::size_t index = 0; index < int8_output.values.size(); ++index) {
+            require_close(int8_output.values[index], int8_expected[index], 0.04F,
+                          "native INT8 ConvRot linear");
+        }
+
+        // Direct loading of a prequantized ConvRot checkpoint uses the same
+        // companion layout produced by the supplied Python converter:
+        // I8 weight, FP32 per-output-row weight_scale, and comfy_quant metadata.
+        std::vector<std::int8_t> prequantized_hadamard{
+             127,  127,  127, -127,
+             127,  127, -127,  127,
+             127, -127,  127,  127,
+            -127,  127,  127,  127};
+        std::vector<float> prequantized_scales(4, 0.5F / 127.0F);
+        sdxl::TensorView prequantized_view;
+        prequantized_view.data = reinterpret_cast<const std::byte*>(prequantized_hadamard.data());
+        prequantized_view.dtype = sdxl::DType::I8;
+        prequantized_view.shape = {4, 4};
+        prequantized_view.strides_bytes = {4, 1};
+        prequantized_view.storage_bytes = prequantized_hadamard.size();
+        prequantized_view.source_key = "test.prequantized.weight";
+        sdxl::TensorView scale_view;
+        scale_view.data = reinterpret_cast<const std::byte*>(prequantized_scales.data());
+        scale_view.dtype = sdxl::DType::F32;
+        scale_view.shape = {4, 1};
+        scale_view.strides_bytes = {static_cast<std::int64_t>(sizeof(float)),
+                                    static_cast<std::int64_t>(sizeof(float))};
+        scale_view.storage_bytes = prequantized_scales.size() * sizeof(float);
+        scale_view.source_key = "test.prequantized.weight_scale";
+        sdxl::QuantizationMetadata prequantized_metadata;
+        prequantized_metadata.weight_scale = scale_view;
+        prequantized_metadata.convrot = true;
+        prequantized_metadata.per_row = true;
+        prequantized_metadata.convrot_group_size = 4;
+        int8_options.require_prequantized = true;
+        int8_options.quantize_floating_weights = false;
+        auto direct_int8_weight = sdxl::cuda::upload_or_quantize_int8_weight(
+            runtime, prequantized_view, &prequantized_metadata,
+            sdxl::cuda::TensorRole::Model, int8_options);
+        auto direct_int8_output = ops.linear(
+            int8_input, direct_int8_weight, nullptr).to_host_f32(runtime);
+        for (std::size_t index = 0; index < direct_int8_output.values.size(); ++index) {
+            require_close(direct_int8_output.values[index], int8_expected[index], 0.04F,
+                          "prequantized INT8 ConvRot linear");
         }
 
         // FP32/TF32 cuBLASLt path used by the force-upcast VAE.
@@ -383,6 +517,29 @@ int main() {
             scheduler_prediction, scheduler_sample, 1.0F, 0.0F, 0).to_host_f32(runtime);
         require_close(euler.values[0], 0.5F, 0.02F, "Euler");
         require_close(euler.values[1], 2.5F, 0.02F, "Euler");
+
+        // DPM++ 2M predicted-original conversion and first/second-order updates.
+        const auto dpm_denoised = ops.predicted_original(
+            scheduler_prediction, scheduler_sample, 1.0F, 0).to_host_f32(runtime);
+        require_close(dpm_denoised.values[0], 0.5F, 0.02F, "DPM++ 2M x0");
+        require_close(dpm_denoised.values[1], 2.5F, 0.02F, "DPM++ 2M x0");
+        auto dpm_denoised_device = upload(runtime, {1, 1, 1, 2}, {0.5F, 2.5F});
+        const auto dpm_first = ops.dpmpp_2m_step(
+            dpm_denoised_device, scheduler_sample, nullptr,
+            1.0F, 0.5F).to_host_f32(runtime);
+        require_close(dpm_first.values[0], 0.75F, 0.02F, "DPM++ 2M first order");
+        require_close(dpm_first.values[1], 2.25F, 0.02F, "DPM++ 2M first order");
+        auto old_denoised = upload(runtime, {1, 1, 1, 2}, {0.25F, 3.0F});
+        const auto dpm_second = ops.dpmpp_2m_step(
+            dpm_denoised_device, scheduler_sample, &old_denoised,
+            1.0F, 0.5F, 2.0F).to_host_f32(runtime);
+        require_close(dpm_second.values[0], 0.8125F, 0.02F, "DPM++ 2M second order");
+        require_close(dpm_second.values[1], 2.125F, 0.02F, "DPM++ 2M second order");
+        const auto dpm_final = ops.dpmpp_2m_step(
+            dpm_denoised_device, scheduler_sample, &old_denoised,
+            1.0F, 0.0F, 2.0F).to_host_f32(runtime);
+        require_close(dpm_final.values[0], 0.5F, 0.02F, "DPM++ 2M final");
+        require_close(dpm_final.values[1], 2.5F, 0.02F, "DPM++ 2M final");
 
         // Fused Euler input scaling and CFG/scheduler update match the separate path.
         const auto scaled_repeated = ops.euler_scale_repeat_input(

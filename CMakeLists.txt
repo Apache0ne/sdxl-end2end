@@ -71,6 +71,7 @@ add_library(sdxl_cuda STATIC
     src/tokenizer.cpp
     src/resources/sdxl_tokenizer_data.cpp
     src/scheduler.cpp
+    src/gits_schedule_data.cpp
     src/png.cpp
     src/cuda/runtime.cpp
     src/cuda/profiler.cpp
@@ -79,6 +80,7 @@ add_library(sdxl_cuda STATIC
     src/cuda/tensor.cu
     src/cuda/weights.cu
     src/cuda/fp8_kernels.cu
+    src/cuda/int8_convrot.cu
     src/cuda/ops_blas.cpp
     src/cuda/ops_kernels.cu
     src/cuda/flash_attention_sm80.cu
@@ -148,12 +150,21 @@ if(SDXL_BUILD_TESTS)
     enable_testing()
     add_executable(sdxl_cuda_ops_test tests/cuda/cuda_ops_test.cu)
     target_link_libraries(sdxl_cuda_ops_test PRIVATE sdxl_cuda)
+    target_include_directories(sdxl_cuda_ops_test PRIVATE src/cuda)
     set_target_properties(sdxl_cuda_ops_test PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
     add_test(NAME sdxl_cuda_ops_test COMMAND sdxl_cuda_ops_test)
 
     add_executable(sdxl_builtin_tokenizer_test tests/builtin_tokenizer_test.cpp)
     target_link_libraries(sdxl_builtin_tokenizer_test PRIVATE sdxl_cuda)
     add_test(NAME sdxl_builtin_tokenizer_test COMMAND sdxl_builtin_tokenizer_test)
+
+    add_executable(sdxl_scheduler_parity_test tests/scheduler_parity_test.cpp)
+    target_link_libraries(sdxl_scheduler_parity_test PRIVATE sdxl_cuda)
+    add_test(NAME sdxl_scheduler_parity_test COMMAND sdxl_scheduler_parity_test)
+
+    add_executable(sdxl_int8_metadata_test tests/int8_metadata_test.cpp)
+    target_link_libraries(sdxl_int8_metadata_test PRIVATE sdxl_cuda)
+    add_test(NAME sdxl_int8_metadata_test COMMAND sdxl_int8_metadata_test)
 endif()
 
 if(SDXL_BUILD_CPU_REFERENCE)

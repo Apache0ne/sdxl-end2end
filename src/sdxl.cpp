@@ -570,6 +570,142 @@ struct DerivedLookup {
     return *match;
 }
 
+[[nodiscard]] std::string strip_view_annotation(std::string value) {
+    const auto bracket = value.find('[');
+    if (bracket != std::string::npos) value.resize(bracket);
+    return value;
+}
+
+[[nodiscard]] std::vector<std::string> quantization_prefix_candidates(
+    const ParameterSlot& slot, const TensorView& bound) {
+    std::vector<std::string> prefixes;
+    auto insert = [&](std::string prefix) {
+        if (prefix.empty()) return;
+        if (std::find(prefixes.begin(), prefixes.end(), prefix) == prefixes.end()) {
+            prefixes.push_back(std::move(prefix));
+        }
+    };
+    auto add_key = [&](std::string key) {
+        key = strip_view_annotation(std::move(key));
+        constexpr std::string_view dot_weight = ".weight";
+        constexpr std::string_view underscore_weight = "_weight";
+        if (ends_with(key, dot_weight)) {
+            // PyTorch module layout: <module>.weight -> <module>.weight_scale.
+            insert(key.substr(0, key.size() - dot_weight.size() + 1));
+        } else if (ends_with(key, underscore_weight)) {
+            // Original OpenCLIP fused QKV layout commonly uses
+            // attn.in_proj_weight + attn.in_proj_weight_scale. Keep the
+            // append-style spelling too for converters that serialize
+            // attn.in_proj_weight.weight_scale.
+            insert(key.substr(0, key.size() - std::string_view("weight").size()));
+            insert(key + '.');
+        } else {
+            // Parameter names such as OpenCLIP text_projection have no final
+            // ".weight" in original SDXL checkpoints.
+            insert(key + '.');
+        }
+    };
+
+    add_key(bound.source_key);
+    add_key(slot.logical_name);
+    for (const std::string prefix : {"unet.", "vae.", "text_encoder.", "text_encoder_2."}) {
+        if (starts_with(slot.logical_name, prefix)) {
+            add_key(slot.logical_name.substr(prefix.size()));
+        }
+    }
+
+    const std::vector<std::string> snapshot = prefixes;
+    for (const std::string& prefix : snapshot) {
+        if (starts_with(prefix, "model.")) insert(prefix.substr(6));
+        else insert("model." + prefix);
+    }
+    return prefixes;
+}
+
+[[nodiscard]] std::string tensor_u8_string(const TensorView& view) {
+    if (view.dtype != DType::U8 || view.shape.size() != 1 || !view.contiguous()) return {};
+    return std::string(reinterpret_cast<const char*>(view.data),
+                       static_cast<std::size_t>(view.element_count()));
+}
+
+[[nodiscard]] TensorView quantization_scale_for_slot(
+    TensorView scale, const ParameterSlot& slot) {
+    if (slot.expected_shape.empty()) return scale;
+    const std::uint64_t output_rows = slot.expected_shape.front();
+    if (scale.element_count() == output_rows) return scale.squeeze_trailing_ones();
+
+    // Original OpenCLIP checkpoints store Q/K/V in one in_proj_weight. The
+    // C++ graph exposes zero-copy row slices, so a prequantized checkpoint's
+    // per-row scale vector must receive the identical slice.
+    if (scale.element_count() == 3 * output_rows && !scale.shape.empty() &&
+        scale.shape.front() == 3 * output_rows) {
+        std::size_t index = 3;
+        if (ends_with(slot.logical_name, "self_attn.q_proj.weight")) index = 0;
+        else if (ends_with(slot.logical_name, "self_attn.k_proj.weight")) index = 1;
+        else if (ends_with(slot.logical_name, "self_attn.v_proj.weight")) index = 2;
+        if (index < 3) {
+            return scale.slice(0, index * output_rows, output_rows)
+                        .squeeze_trailing_ones();
+        }
+    }
+    return scale;
+}
+
+[[nodiscard]] std::optional<QuantizationMetadata> bind_quantization_metadata(
+    const WeightStore& store, const ParameterSlot& slot, const TensorView& bound) {
+    if (slot.expected_shape.size() != 2 || !ends_with(slot.logical_name, ".weight")) {
+        return std::nullopt;
+    }
+
+    QuantizationMetadata metadata;
+    for (const std::string& prefix : quantization_prefix_candidates(slot, bound)) {
+        if (!metadata.weight_scale.has_value()) {
+            if (const TensorView* scale = store.find(prefix + "weight_scale")) {
+                metadata.weight_scale = quantization_scale_for_slot(*scale, slot);
+            }
+        }
+        if (!metadata.input_scale.has_value()) {
+            if (const TensorView* scale = store.find(prefix + "input_scale")) {
+                metadata.input_scale = *scale;
+            }
+        }
+        if (const TensorView* config = store.find(prefix + "comfy_quant")) {
+            try {
+                const std::string text = tensor_u8_string(*config);
+                if (!text.empty()) {
+                    const json::Value parsed = json::parse(text);
+                    if (const json::Value* value = parsed.find("convrot")) {
+                        metadata.convrot = value->as_bool();
+                    }
+                    if (const json::Value* value = parsed.find("per_row")) {
+                        metadata.per_row = value->as_bool();
+                    }
+                    if (const json::Value* value = parsed.find("convrot_groupsize")) {
+                        metadata.convrot_group_size = static_cast<std::size_t>(value->as_u64());
+                    }
+                }
+            } catch (const std::exception&) {
+                // Ignore malformed optional metadata here. The native INT8 loader
+                // performs strict validation when an INT8 precision profile is selected.
+            }
+            break;
+        }
+    }
+
+    if (!metadata.weight_scale.has_value() && !metadata.input_scale.has_value() &&
+        !metadata.convrot && metadata.convrot_group_size == 0) {
+        return std::nullopt;
+    }
+    if (metadata.weight_scale.has_value() && !metadata.per_row) {
+        const TensorView& scale = *metadata.weight_scale;
+        metadata.per_row = scale.element_count() == slot.expected_shape[0];
+    }
+    if (metadata.convrot && metadata.convrot_group_size == 0) {
+        metadata.convrot_group_size = 256;
+    }
+    return metadata;
+}
+
 [[nodiscard]] std::optional<TensorView> bind_original_parameter(const WeightStore& store,
                                                                 const ParameterSlot& slot) {
     if (const TensorView* direct = store.find(slot.logical_name)) return *direct;
@@ -749,7 +885,10 @@ SDXLWeightLoader::SDXLWeightLoader(LoadOptions options) : options_(options) {}
 
 LoadResult SDXLWeightLoader::load(SDXLModel& model, const std::filesystem::path& path) {
     LoadResult result;
-    for (auto& [_, slot] : model.graph().parameter_index()) slot->tensor.reset();
+    for (auto& [_, slot] : model.graph().parameter_index()) {
+        slot->tensor.reset();
+        slot->quantization.reset();
+    }
 
     if (std::filesystem::is_directory(path)) {
         result.layout = CheckpointLayout::DiffusersDirectory;
@@ -764,6 +903,7 @@ LoadResult SDXLWeightLoader::load(SDXLModel& model, const std::filesystem::path&
             const std::string key = component_key(logical);
             if (const TensorView* view = store_it->second->find(key)) {
                 slot->tensor = *view;
+                slot->quantization = bind_quantization_metadata(*store_it->second, *slot, *view);
                 ++result.parameters_bound;
             }
         }
@@ -780,6 +920,7 @@ LoadResult SDXLWeightLoader::load(SDXLModel& model, const std::filesystem::path&
                     TensorView squeezed = view->squeeze_trailing_ones();
                     if (squeezed.shape == slot->expected_shape) *view = std::move(squeezed);
                 }
+                slot->quantization = bind_quantization_metadata(store, *slot, *view);
                 slot->tensor = std::move(*view);
                 ++result.parameters_bound;
             }

@@ -17,21 +17,21 @@ New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 $csv = Join-Path $OutputDir "benchmark.csv"
 if (Test-Path $csv) { Remove-Item $csv }
 
-function Invoke-ColdCase([int]$Size, [string]$Scheduler, [string]$Precision) {
-    $tag = "cold_${Size}_${Scheduler}_${Precision}".Replace("-", "_")
+function Invoke-ColdCase([int]$Size, [string]$Sampler, [string]$Precision) {
+    $tag = "cold_${Size}_${Sampler}_normal_${Precision}".Replace("-", "_")
     $png = Join-Path $OutputDir "$tag.png"
     $trace = Join-Path $OutputDir "$tag.trace.json"
-    & $cli $Model $Size $Size $Steps $Cfg $Seed $Scheduler $Prompt $Negative $png `
-        --memory low --precision $Precision --attention auto --profile --profile-json $trace `
+    & $cli $Model $Size $Size $Steps $Cfg $Seed $Prompt $Negative $png `
+        --sampler $Sampler --scheduler normal --memory low --precision $Precision --attention auto --profile --profile-json $trace `
         --benchmark-csv $csv --sync-png
     if ($LASTEXITCODE -ne 0) { throw "Cold benchmark failed: $tag" }
 }
 
 # Cold process baselines: filesystem/model mapping, uploads, execution and PNG.
 foreach ($size in @(512, 1024)) {
-    foreach ($scheduler in @("euler", "ddim")) {
+    foreach ($sampler in @("dpmpp_2m", "euler", "ddim")) {
         foreach ($precision in @("fp16", "fp8-auto")) {
-            Invoke-ColdCase $size $scheduler $precision
+            Invoke-ColdCase $size $sampler $precision
         }
     }
 }
@@ -42,8 +42,8 @@ $jobs = Join-Path $OutputDir "warm_jobs.tsv"
     "$Prompt`t$Negative`t$(Join-Path $OutputDir 'warm_first.png')`t$Seed`t1",
     "$Prompt`t$Negative`t$(Join-Path $OutputDir 'warm_second.png')`t$($Seed + 1)`t1"
 ) | Set-Content -Encoding UTF8 $jobs
-& $cli $Model 1024 1024 $Steps $Cfg $Seed euler --jobs $jobs `
-    --memory balanced --precision fp8-auto --attention auto --preload --cuda-graph --profile `
+& $cli $Model 1024 1024 $Steps $Cfg $Seed --jobs $jobs `
+    --sampler dpmpp_2m --scheduler normal --memory balanced --precision fp8-auto --attention auto --preload --cuda-graph --profile `
     --benchmark-csv $csv --sync-png
 if ($LASTEXITCODE -ne 0) { throw "Warm persistent CLI benchmark failed" }
 
@@ -51,8 +51,8 @@ if ($LASTEXITCODE -ne 0) { throw "Warm persistent CLI benchmark failed" }
 if (Test-Path $server) {
     $serverLog = Join-Path $OutputDir "server.log"
     $commands = @(
-        "generate`t$Prompt`t$Negative`t$(Join-Path $OutputDir 'server_first.png')`t$Seed`t1024`t1024`t$Steps`t$Cfg`teuler`t1`t1`t1",
-        "generate`t$Prompt`t$Negative`t$(Join-Path $OutputDir 'server_second.png')`t$($Seed + 1)`t1024`t1024`t$Steps`t$Cfg`teuler`t1`t1`t1",
+        "generate`t$Prompt`t$Negative`t$(Join-Path $OutputDir 'server_first.png')`t$Seed`t1024`t1024`t$Steps`t$Cfg`tdpmpp_2m`tnormal`t1`t1`t1`t0",
+        "generate`t$Prompt`t$Negative`t$(Join-Path $OutputDir 'server_second.png')`t$($Seed + 1)`t1024`t1024`t$Steps`t$Cfg`tdpmpp_2m`tnormal`t1`t1`t1`t0",
         "stats",
         "quit"
     )

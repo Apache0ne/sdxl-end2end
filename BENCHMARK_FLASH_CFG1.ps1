@@ -12,8 +12,8 @@ if (Test-Path $Csv) { Remove-Item $Csv -Force }
 
 $Prompt = "a cinematic photograph of a city at night"
 $Negative = "blurry"
-$Common = @($Model, "1024", "1024", "4", "1.0", "1234", "euler", $Prompt, $Negative)
-$Runtime = @("--memory", "balanced", "--precision", "fp8-auto", "--arena-reserve-mib", "1024", "--sync-png", "--profile", "--benchmark-csv", $Csv)
+$Common = @($Model, "1024", "1024", "4", "1.0", "1234", $Prompt, $Negative)
+$Runtime = @("--sampler", "dpmpp_2m", "--scheduler", "normal", "--memory", "balanced", "--precision", "fp8-auto", "--arena-reserve-mib", "1024", "--sync-png", "--profile", "--benchmark-csv", $Csv)
 
 function Run-Case([string]$Name, [string[]]$Extra) {
     $Output = Join-Path $OutDir ($Name + ".png")
@@ -45,4 +45,4 @@ try {
 }
 
 Write-Host "`nResults: $Csv"
-Import-Csv $Csv | Select-Object attention,cfg_bypassed,wall_ms,denoise_ms,attention_ms,cudnn_attention_ms,flash_attention_ms,warp_attention_ms,linear_ms,convolution_ms,temp_driver_alloc_delta | Format-Table -AutoSize
+Import-Csv $Csv | Select-Object sampler,scheduler,attention,cfg_bypassed,wall_ms,denoise_ms,attention_ms,cudnn_attention_ms,flash_attention_ms,warp_attention_ms,linear_ms,convolution_ms,temp_driver_alloc_delta | Format-Table -AutoSize

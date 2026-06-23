@@ -111,7 +111,8 @@ namespace {
 
 void validate_allocation_policy(const Runtime& runtime, ScalarType type, TensorRole role) {
     if (type != ScalarType::Float32 || !runtime.options().strict_non_vae_fp32) return;
-    if (role == TensorRole::VAE || role == TensorRole::FP8ScaleMetadata ||
+    if (role == TensorRole::SamplerState || role == TensorRole::VAE ||
+        role == TensorRole::FP8ScaleMetadata || role == TensorRole::QuantizationMetadata ||
         role == TensorRole::HostInterop) return;
     throw CudaError("strict precision policy rejected a non-VAE float32 tensor allocation");
 }
@@ -126,6 +127,7 @@ std::size_t scalar_size(ScalarType type) noexcept {
     switch (type) {
     case ScalarType::Float8E4M3:
     case ScalarType::Float8E5M2: return sizeof(std::uint8_t);
+    case ScalarType::Int8: return sizeof(std::int8_t);
     case ScalarType::Float16: return sizeof(__half);
     case ScalarType::Float32: return sizeof(float);
     case ScalarType::Int32: return sizeof(std::int32_t);
@@ -137,6 +139,7 @@ const char* scalar_name(ScalarType type) noexcept {
     switch (type) {
     case ScalarType::Float8E4M3: return "float8_e4m3";
     case ScalarType::Float8E5M2: return "float8_e5m2";
+    case ScalarType::Int8: return "int8";
     case ScalarType::Float16: return "float16";
     case ScalarType::Float32: return "float32";
     case ScalarType::Int32: return "int32";
@@ -147,8 +150,10 @@ const char* scalar_name(ScalarType type) noexcept {
 const char* tensor_role_name(TensorRole role) noexcept {
     switch (role) {
     case TensorRole::Model: return "model";
+    case TensorRole::SamplerState: return "sampler_state";
     case TensorRole::VAE: return "vae";
     case TensorRole::FP8ScaleMetadata: return "fp8_scale_metadata";
+    case TensorRole::QuantizationMetadata: return "quantization_metadata";
     case TensorRole::HostInterop: return "host_interop";
     }
     return "unknown";
@@ -272,6 +277,7 @@ Tensor Tensor::view(std::vector<std::size_t> shape, std::size_t element_offset) 
     result.dequant_scale_count_ = dequant_scale_count_;
     result.dequant_scale_mode_ = dequant_scale_mode_;
     result.fp8_storage_layout_ = fp8_storage_layout_;
+    result.convrot_group_size_ = convrot_group_size_;
     return result;
 }
 
@@ -334,7 +340,29 @@ FloatTensor Tensor::to_host_f32(const Runtime& runtime) const {
         }
         return result;
     }
-    throw CudaError("cannot convert an int32 CUDA tensor to FloatTensor");
+    if (type_ == ScalarType::Int8) {
+        std::vector<std::int8_t> packed(elements());
+        std::vector<float> scales(dequant_scale_count_ == 0 ? 1 : dequant_scale_count_, 1.0F);
+        SDXL_CUDA_CHECK(cudaMemcpyAsync(packed.data(), data(), bytes(),
+                                        cudaMemcpyDeviceToHost, runtime.stream()));
+        if (dequant_scale_data_ != nullptr) {
+            SDXL_CUDA_CHECK(cudaMemcpyAsync(scales.data(), dequant_scale_data_,
+                                            scales.size() * sizeof(float),
+                                            cudaMemcpyDeviceToHost, runtime.stream()));
+        }
+        runtime.synchronize();
+        const std::size_t row_width = rank() == 2 ? size(1) : elements();
+        for (std::size_t logical = 0; logical < elements(); ++logical) {
+            const std::size_t output_channel = row_width == 0 ? 0 : logical / row_width;
+            std::size_t scale_index = 0;
+            if (dequant_scale_mode_ == FP8ScaleMode::PerOutputChannel && !scales.empty()) {
+                scale_index = std::min(output_channel, scales.size() - 1);
+            }
+            result.values[logical] = static_cast<float>(packed[logical]) * scales[scale_index];
+        }
+        return result;
+    }
+    throw CudaError("cannot convert this integer CUDA tensor to FloatTensor");
 }
 
 void Tensor::set_fp8_storage_layout(FP8StorageLayout layout) {
@@ -344,10 +372,33 @@ void Tensor::set_fp8_storage_layout(FP8StorageLayout layout) {
     fp8_storage_layout_ = layout;
 }
 
+void Tensor::set_convrot_group_size(std::size_t group_size) {
+    if (type_ != ScalarType::Int8 || rank() != 2) {
+        throw CudaError("ConvRot metadata can only be attached to rank-2 INT8 tensors");
+    }
+    if (group_size != 0) {
+        std::size_t value = group_size;
+        if (value < 4 || value > 256) {
+            throw CudaError("ConvRot group size must be zero or a power of four from 4 to 256");
+        }
+        while (value > 1) {
+            if (value % 4 != 0) {
+                throw CudaError("ConvRot group size must be zero or a power of four from 4 to 256");
+            }
+            value /= 4;
+        }
+    }
+    convrot_group_size_ = group_size;
+}
+
 void Tensor::attach_dequant_scale(const Tensor& scale, FP8ScaleMode mode) {
-    if (!is_fp8(type_)) throw CudaError("dequantization scales can only be attached to FP8 tensors");
-    if (scale.type_ != ScalarType::Float32 || scale.role_ != TensorRole::FP8ScaleMetadata) {
-        throw CudaError("FP8 dequantization scale must be float32 scale metadata");
+    if (!is_fp8(type_) && type_ != ScalarType::Int8) {
+        throw CudaError("dequantization scales can only be attached to FP8 or INT8 tensors");
+    }
+    if (scale.type_ != ScalarType::Float32 ||
+        (scale.role_ != TensorRole::FP8ScaleMetadata &&
+         scale.role_ != TensorRole::QuantizationMetadata)) {
+        throw CudaError("dequantization scale must be float32 quantization metadata");
     }
     const std::size_t expected = mode == FP8ScaleMode::PerOutputChannel
         ? (rank() == 2 ? size(0) : 0) : 1;
@@ -368,12 +419,13 @@ void Tensor::copy_from(const Runtime& runtime, const Tensor& source) {
     }
     SDXL_CUDA_CHECK(cudaMemcpyAsync(data(), source.data(), bytes(),
                                     cudaMemcpyDeviceToDevice, runtime.stream()));
-    if (is_fp8(type_)) {
+    if (is_fp8(type_) || type_ == ScalarType::Int8) {
         dequant_scale_allocation_ = source.dequant_scale_allocation_;
         dequant_scale_data_ = source.dequant_scale_data_;
         dequant_scale_count_ = source.dequant_scale_count_;
         dequant_scale_mode_ = source.dequant_scale_mode_;
         fp8_storage_layout_ = source.fp8_storage_layout_;
+        convrot_group_size_ = source.convrot_group_size_;
     }
 }
 

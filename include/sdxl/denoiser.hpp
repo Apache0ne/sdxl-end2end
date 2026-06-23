@@ -12,11 +12,6 @@
 
 namespace sdxl {
 
-enum class SchedulerKind {
-    EulerDiscrete,
-    DDIM
-};
-
 struct SDXLDenoiseOptions {
     std::size_t width = 1024;
     std::size_t height = 1024;
@@ -25,7 +20,9 @@ struct SDXLDenoiseOptions {
     float guidance_rescale = 0.0F;
     float ddim_eta = 0.0F;
     std::uint64_t seed = 0;
-    SchedulerKind scheduler = SchedulerKind::EulerDiscrete;
+    SamplerKind sampler = SamplerKind::DPMpp2M;
+    SchedulerKind scheduler = SchedulerKind::Normal;
+    SamplerConfig sampler_config{};
     SchedulerConfig scheduler_config{};
     SDXLMicroConditioning positive_micro{};
     std::optional<SDXLMicroConditioning> negative_micro;

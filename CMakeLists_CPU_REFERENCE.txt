@@ -19,6 +19,7 @@ add_library(sdxl_raw STATIC
     src/text_encoder.cpp
     src/unet.cpp
     src/scheduler.cpp
+    src/gits_schedule_data.cpp
     src/denoiser.cpp
 )
 
@@ -66,3 +67,11 @@ add_test(NAME sdxl_unet_scheduler_test COMMAND sdxl_unet_scheduler_test)
 add_executable(sdxl_builtin_tokenizer_test tests/builtin_tokenizer_test.cpp)
 target_link_libraries(sdxl_builtin_tokenizer_test PRIVATE sdxl_raw)
 add_test(NAME sdxl_builtin_tokenizer_test COMMAND sdxl_builtin_tokenizer_test)
+
+add_executable(sdxl_scheduler_parity_test tests/scheduler_parity_test.cpp)
+target_link_libraries(sdxl_scheduler_parity_test PRIVATE sdxl_raw)
+add_test(NAME sdxl_scheduler_parity_test COMMAND sdxl_scheduler_parity_test)
+
+add_executable(sdxl_int8_metadata_test tests/int8_metadata_test.cpp)
+target_link_libraries(sdxl_int8_metadata_test PRIVATE sdxl_raw)
+add_test(NAME sdxl_int8_metadata_test COMMAND sdxl_int8_metadata_test)

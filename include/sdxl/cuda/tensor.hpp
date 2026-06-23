@@ -17,6 +17,7 @@ namespace sdxl::cuda {
 enum class ScalarType : std::uint8_t {
     Float8E4M3,
     Float8E5M2,
+    Int8,
     Float16,
     Float32,
     Int32
@@ -24,8 +25,10 @@ enum class ScalarType : std::uint8_t {
 
 enum class TensorRole : std::uint8_t {
     Model,
+    SamplerState,
     VAE,
     FP8ScaleMetadata,
+    QuantizationMetadata,
     HostInterop
 };
 
@@ -98,6 +101,8 @@ public:
     [[nodiscard]] const void* data() const noexcept { return data_; }
     [[nodiscard]] std::uint8_t* fp8_data() noexcept { return static_cast<std::uint8_t*>(data_); }
     [[nodiscard]] const std::uint8_t* fp8_data() const noexcept { return static_cast<const std::uint8_t*>(data_); }
+    [[nodiscard]] std::int8_t* int8_data() noexcept { return static_cast<std::int8_t*>(data_); }
+    [[nodiscard]] const std::int8_t* int8_data() const noexcept { return static_cast<const std::int8_t*>(data_); }
     [[nodiscard]] __half* half_data() noexcept { return static_cast<__half*>(data_); }
     [[nodiscard]] const __half* half_data() const noexcept { return static_cast<const __half*>(data_); }
     [[nodiscard]] float* float_data() noexcept { return static_cast<float*>(data_); }
@@ -120,7 +125,10 @@ public:
     [[nodiscard]] std::size_t dequant_scale_count() const noexcept { return dequant_scale_count_; }
     [[nodiscard]] FP8ScaleMode dequant_scale_mode() const noexcept { return dequant_scale_mode_; }
     [[nodiscard]] FP8StorageLayout fp8_storage_layout() const noexcept { return fp8_storage_layout_; }
+    [[nodiscard]] std::size_t convrot_group_size() const noexcept { return convrot_group_size_; }
+    [[nodiscard]] bool uses_convrot() const noexcept { return convrot_group_size_ != 0; }
     void set_fp8_storage_layout(FP8StorageLayout layout);
+    void set_convrot_group_size(std::size_t group_size);
     void attach_dequant_scale(const Tensor& scale, FP8ScaleMode mode = FP8ScaleMode::TensorWide);
 
     [[nodiscard]] FloatTensor to_host_f32(const Runtime& runtime) const;
@@ -145,6 +153,7 @@ private:
     std::size_t dequant_scale_count_ = 0;
     FP8ScaleMode dequant_scale_mode_ = FP8ScaleMode::None;
     FP8StorageLayout fp8_storage_layout_ = FP8StorageLayout::RowMajorNK;
+    std::size_t convrot_group_size_ = 0;
 };
 
 [[nodiscard]] std::size_t element_count(std::span<const std::size_t> shape);

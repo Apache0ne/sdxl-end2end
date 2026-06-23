@@ -79,6 +79,14 @@ support surface.
 In auto mode, tiny 77-token CLIP attention uses warp-online; large eligible UNet shapes prefer
 cuDNN SDPA, then flash-sm80.
 
+## Sampler and scheduler dispatch
+
+Sampler and sigma schedule are independent request properties. `dpmpp_2m` with `normal` is the
+default. Euler and DDIM remain selectable, and all samplers can use `normal`, `karras`,
+`exponential`, `sgm_uniform`, `simple`, `ddim_uniform`, `ddim_trailing`, `beta`,
+`linear_quadratic`, `kl_optimal`, or `gits`. DPM++ 2M stores one previous predicted-original FP16 tensor per request. Sampler and
+scheduler are included in the CUDA Graph key.
+
 ## CFG=1 conditional-only path
 
 When guidance is at most 1 and `--force-cfg` is absent, the engine does not create or execute the
@@ -123,3 +131,19 @@ cached by shape and policy.
 
 The normal executables link the CUDA executor only. CUDA, cuBLASLt, cuDNN, SDPA, cache, or shape
 failures are fatal; neural operations are never redirected to the scalar CPU reference path.
+
+## Ancestral and SDE sampler controls
+
+The CUDA denoiser implements DPM++ SDE, Euler ancestral, and DPM++ 2S ancestral
+CFG++ with FP16 device-resident state updates. `--noise-device gpu` uses the
+runtime CUDA normal generator; `--noise-device cpu` generates the requested
+noise on the host and uploads only the noise tensor. This is not a neural CPU
+fallback. DPM++ 2S ancestral CFG++ forces the negative/unconditional branch even
+when CFG is 1 because the CFG++ correction requires it.
+
+
+## ComfyUI-compatible sampler state
+
+The UNet remains an FP16/FP8 CUDA model, but sampler state is a separate tensor role. `TensorRole::SamplerState` may be FP32 and is never accepted as a persistent model weight. `Ops::euler_scale_input` divides FP32 state by `sqrt(1+sigma^2)` and writes an FP16 `TensorRole::Model` tensor for the UNet. Model output is converted back into FP32 predicted-clean/state updates. This keeps cuDNN/cuBLASLt execution unchanged while matching ComfyUI KSampler numerical behavior.
+
+CPU noise is generated in host Float32 and uploaded. GPU mode uses CUDA Philox. The full-denoise parity scale is `sqrt(1+sigma_max^2)`; `--initial-noise-scaling sigma` retains the previous behavior for A/B testing. Stochastic CPU/Brownian parity execution is eager rather than CUDA Graph captured.

@@ -20,7 +20,10 @@ enum class MemoryMode : std::uint8_t { Low, Balanced, High };
 
 struct PrecisionProfile {
     bool fp8 = true;
+    bool int8 = false;
+    bool int8_clip = true;
     FP8WeightLoadOptions weights;
+    INT8WeightLoadOptions int8_weights;
     FP8BackendPreference runtime_backend = FP8BackendPreference::Auto;
     std::string canonical = "fp8-auto";
 };
@@ -56,7 +59,10 @@ struct GenerationRequest {
     float guidance = 5.0F;
     float guidance_rescale = 0.0F;
     float ddim_eta = 0.0F;
-    SchedulerKind scheduler = SchedulerKind::EulerDiscrete;
+    SamplerKind sampler = SamplerKind::DPMpp2M;
+    SchedulerKind scheduler = SchedulerKind::Normal;
+    SamplerConfig sampler_config{};
+    SchedulerConfig scheduler_config{};
     bool cuda_graph = false;
     bool force_cfg = false;
     bool profile = false;
