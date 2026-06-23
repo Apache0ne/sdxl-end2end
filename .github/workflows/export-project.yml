@@ -1,0 +1,55 @@
+name: Export project archive
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out pull request source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Build clean project archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/sdxl-export/sdxl-end2end
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.github/workflows/export-project.yml' \
+            "$GITHUB_WORKSPACE/" /tmp/sdxl-export/sdxl-end2end/
+          cd /tmp/sdxl-export
+          find sdxl-end2end -type f -print | sort > sdxl-end2end/EXPORTED_FILE_LIST.txt
+          zip -r "$GITHUB_WORKSPACE/sdxl-end2end-main-complete.zip" sdxl-end2end
+
+      - name: Upload complete project ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdxl-end2end-main-complete
+          path: sdxl-end2end-main-complete.zip
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Delete temporary export branch
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          encoded_branch=$(python3 -c 'import urllib.parse; print(urllib.parse.quote("chatgpt-export-pr-20260623", safe=""))')
+          curl -fsSL -X DELETE \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs/heads/${encoded_branch}"
+          exit 0
